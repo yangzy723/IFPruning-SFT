@@ -1,0 +1,27 @@
+# ==========================================
+# IFPruning SFT Project .gitignore
+# ==========================================
+
+# 1. Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 2. 预训练模型权重
+gemma-4-12b/
+Qwen3.5-0.8b/
+
+# 3. 数据集与 HuggingFace 缓存
+alpaca-cleaned/
+hf_cache/
+
+# 4. 训练输出目录 (Checkpoint、Logs、DeepSpeed States)
+gemma-12b-ifpruning-output/
+test_restore_output/
+*.log
+
+# 5. 系统与编辑器文件
+.DS_Store
+.vscode/
+.idea/
