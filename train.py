@@ -128,9 +128,9 @@ def rank0_json_dump(path: Path, obj: Any) -> None:
 # =============================================================================
 @dataclass
 class RunConfig:
-    base_model: str = "./gemma-4-12b"
-    predictor_model: str = "./Qwen3.5-0.8b"
-    output_dir: str = "./gemma-12b-ifpruning-output"
+    base_model: str = "./gemma-4-12B"
+    predictor_model: str = "./Qwen3.5-0.8B"
+    output_dir: str = "./gemma-12B-ifpruning-output"
     
     dataset_alpaca: str = "./alpaca-cleaned/alpaca_data_cleaned.json"
     dataset_hermes: str = "./OpenHermes-2.5/openhermes2_5.json"

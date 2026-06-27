@@ -6,8 +6,6 @@ This repository implements the Supervised Fine-Tuning (SFT) phase of the [Instru
 
 Unlike traditional static pruning or low-rank adaptations, IFPruning dynamically determines which feed-forward network (FFN) channels are essential for a specific input prompt, achieving high sparsity while preserving complex reasoning capabilities. The repository provides native support for DeepSpeed ZeRO optimization, distributed multi-GPU training, and multi-source data blending.
 
-![loss curve](loss_curve.png)
-
 ## 2. Core Methodology
 
 IFPruning learns to dynamically sparsify FFN activations conditioned on the user's instruction.
@@ -92,6 +90,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=2 train.py
 ```
 
+![loss curve](loss_curve.png)
+
 ### 6.2 Inference
 
 Use `inference_IFP.py` to deploy the pruned model. The predictor injects dynamic masks based on input prompt semantics.
@@ -105,13 +105,19 @@ python inference_IFP.py \
 
 ### 6.3 Checkpoint and Restore
 
-Before full training, run the audit tool to confirm checkpoint consistency:
+Run checkpoint validation before a full training run to verify state integrity.
 
+**Phase 1: State checkpoint**
 ```bash
-# Verify restoration of optimizer slices and dynamic topology
-TEST_PHASE=2 torchrun --nproc_per_node=2 test_ckpt.py --ckpt_dir "./gemma-12b-ifpruning-output"
+TEST_PHASE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=2 test_ckpt.py
 ```
 
+**Phase 2: Checkpoint restore**
+```bash
+TEST_PHASE=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=2 test_ckpt.py
+```
+
+Expected result: successful restoration of optimizer slices and loss trajectory without deadlocks or I/O corruption.
 
 ## 7. Troubleshooting
 

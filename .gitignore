@@ -9,8 +9,8 @@ __pycache__/
 *.so
 
 # 2. 预训练模型权重
-gemma-4-12b/
-Qwen3.5-0.8b/
+gemma-4-12B/
+Qwen3.5-0.8B/
 
 # 3. 数据集与 HuggingFace 缓存
 alpaca-cleaned/

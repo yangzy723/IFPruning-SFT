@@ -8,17 +8,13 @@ import re
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# =============================================================================
-# 1. 核心配置
-# =============================================================================
+# 1. 配置
 LOG_PATH = Path("./gemma-12b-ifpruning-output/logs/rank_0.log")
 OUTPUT_PATH = Path("./loss_curve.png")
 
-SMOOTHING_WEIGHT = 0.85
+SMOOTHING_WEIGHT = 0.6
 
-# =============================================================================
-# 2. 数据解析管道
-# =============================================================================
+# 2. 数据解析
 def parse_training_log(log_path: Path):
     if not log_path.exists():
         raise FileNotFoundError(f"Log file not found: {log_path}")
@@ -49,9 +45,7 @@ def compute_ema(values, weight=0.85):
             smoothed.append(smoothed[-1] * weight + val * (1 - weight))
     return smoothed
 
-# =============================================================================
-# 3. 绘图风格配置
-# =============================================================================
+# 3. 绘图风格
 def set_academic_style():
     plt.rcParams.update({
         "font.family": "serif",           # 使用衬线字体
@@ -72,9 +66,7 @@ def set_academic_style():
         "grid.linestyle": "--"
     })
 
-# =============================================================================
-# 4. 可视化渲染
-# =============================================================================
+# 4. 渲染
 def generate_conference_plot(steps, losses, lrs, alphas):
     set_academic_style()
     
@@ -92,22 +84,17 @@ def generate_conference_plot(steps, losses, lrs, alphas):
         for spine in ax.spines.values():
             spine.set_color('black')
 
-    # ---------------------------------------------------------
     # 顶部子图: Loss (深蓝与砖红)
-    # ---------------------------------------------------------
     smooth_losses = compute_ema(losses, weight=SMOOTHING_WEIGHT)
     
-    # 原始 Loss 用极细虚线，平滑 Loss 用深色粗实线
+    # 原始 Loss 用虚线，平滑 Loss 用粗实线
     ax1.plot(steps, losses, color="#0066CC", linewidth=1.5, linestyle=":", alpha=0.6, label="Batch Loss")
     ax1.plot(steps, smooth_losses, color="#C00000", linewidth=2.5, linestyle="-", label="Smoothed Loss")
     
     ax1.set_ylabel("Cross Entropy Loss")
-    # 图例极简化，去掉阴影，采用纯黑细边框
     ax1.legend(loc="upper right", frameon=True, edgecolor="black", fancybox=False)
 
-    # ---------------------------------------------------------
     # 底部子图: LR & Alpha (深绿与深紫)
-    # ---------------------------------------------------------
     ax2.plot(steps, lrs, color="#548235", linewidth=2.0, linestyle="-", label="Learning Rate")
     ax2.set_xlabel("Training Steps")
     ax2.set_ylabel("Learning Rate")
@@ -124,9 +111,6 @@ def generate_conference_plot(steps, losses, lrs, alphas):
     lines_3, labels_3 = ax3.get_legend_handles_labels()
     ax2.legend(lines_2 + lines_3, labels_2 + labels_3, loc="center right", frameon=True, edgecolor="black", fancybox=False)
 
-    # ---------------------------------------------------------
-    # 布局收尾
-    # ---------------------------------------------------------
     fig.tight_layout()
     fig.subplots_adjust(hspace=0.08) 
     fig.savefig(OUTPUT_PATH, bbox_inches='tight')
