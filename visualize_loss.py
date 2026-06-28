@@ -8,13 +8,17 @@ import re
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# 1. 配置
-LOG_PATH = Path("./gemma-12b-ifpruning-output/logs/rank_0.log")
+# 1. 配置区
+LOG_PATH = Path("./gemma-12B-ifpruning-output/logs/rank_0.log")
 OUTPUT_PATH = Path("./loss_curve.png")
 
-SMOOTHING_WEIGHT = 0.6
+SMOOTHING_WEIGHT = 0.75
 
-# 2. 数据解析
+# 请根据实际使用的模型修改 ORIGINAL_FFN_DIM (例如 Gemma-4-12b 为 14336)
+ORIGINAL_FFN_DIM = 14336 
+TARGET_FFN_DIM = 4096
+
+# 2. 数据解析与转换
 def parse_training_log(log_path: Path):
     if not log_path.exists():
         raise FileNotFoundError(f"Log file not found: {log_path}")
@@ -33,8 +37,11 @@ def parse_training_log(log_path: Path):
 
     if not steps:
         raise ValueError("No valid training metrics found in the log.")
+        
+    max_pruning_ratio = (ORIGINAL_FFN_DIM - TARGET_FFN_DIM) / ORIGINAL_FFN_DIM
+    pruning_ratios = [alpha * max_pruning_ratio for alpha in alphas]
 
-    return steps, losses, lrs, alphas
+    return steps, losses, lrs, pruning_ratios, max_pruning_ratio
 
 def compute_ema(values, weight=0.85):
     smoothed = []
@@ -66,8 +73,8 @@ def set_academic_style():
         "grid.linestyle": "--"
     })
 
-# 4. 渲染
-def generate_conference_plot(steps, losses, lrs, alphas):
+# 4. 渲染图表
+def generate_conference_plot(steps, losses, lrs, pruning_ratios, target_max_ratio):
     set_academic_style()
     
     fig, (ax1, ax2) = plt.subplots(
@@ -84,45 +91,55 @@ def generate_conference_plot(steps, losses, lrs, alphas):
         for spine in ax.spines.values():
             spine.set_color('black')
 
-    # 顶部子图: Loss (深蓝与砖红)
+    # ------------------ 顶部子图: Loss ------------------
     smooth_losses = compute_ema(losses, weight=SMOOTHING_WEIGHT)
-    
-    # 原始 Loss 用虚线，平滑 Loss 用粗实线
-    ax1.plot(steps, losses, color="#0066CC", linewidth=1.5, linestyle=":", alpha=0.6, label="Batch Loss")
-    ax1.plot(steps, smooth_losses, color="#C00000", linewidth=2.5, linestyle="-", label="Smoothed Loss")
+
+    ax1.plot(steps, losses, color="#004C99", linewidth=2, linestyle=":", alpha=0.75, label="Batch Loss")
+    ax1.plot(steps, smooth_losses, color="#C00000", linewidth=2, linestyle="-", label="Smoothed Loss")
     
     ax1.set_ylabel("Cross Entropy Loss")
-    ax1.legend(loc="upper right", frameon=True, edgecolor="black", fancybox=False)
 
-    # 底部子图: LR & Alpha (深绿与深紫)
+    # ------------------ 底部子图: LR & Sparsity ------------------
     ax2.plot(steps, lrs, color="#548235", linewidth=2.0, linestyle="-", label="Learning Rate")
     ax2.set_xlabel("Training Steps")
     ax2.set_ylabel("Learning Rate")
 
-    # 右侧 Y 轴处理 Alpha
     ax3 = ax2.twinx()
-    ax3.plot(steps, alphas, color="#7030A0", linewidth=2.0, linestyle="--", label="Mask Alpha")
-    ax3.set_ylabel("Pruning Alpha")
-    ax3.set_ylim(-0.05, 1.05) 
+    ax3.plot(steps, pruning_ratios, color="#7030A0", linewidth=2.0, linestyle="--", label="Effective Sparsity")
+    ax3.set_ylabel("Effective Pruning Ratio")
+    
+    ax3.set_ylim(0.0, 1.0) 
     ax3.tick_params(direction="in")
 
-    # 合并底部图例
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
     lines_3, labels_3 = ax3.get_legend_handles_labels()
-    ax2.legend(lines_2 + lines_3, labels_2 + labels_3, loc="center right", frameon=True, edgecolor="black", fancybox=False)
-
+    
     fig.tight_layout()
-    fig.subplots_adjust(hspace=0.08) 
+    fig.subplots_adjust(top=0.92, hspace=0.08) 
+    
+    fig.legend(
+        lines_1 + lines_2 + lines_3, 
+        labels_1 + labels_2 + labels_3, 
+        loc="upper center", 
+        bbox_to_anchor=(0.5, 0.99), 
+        ncol=4, 
+        frameon=True, 
+        edgecolor="black", 
+        fancybox=False, 
+        framealpha=1.0
+    )
+
     fig.savefig(OUTPUT_PATH, bbox_inches='tight')
-    fig.savefig(OUTPUT_PATH.with_suffix(".png"), dpi=300, bbox_inches='tight')
     plt.close(fig)
 
     print(f"Academic plot generated: {OUTPUT_PATH}")
     print(f"Total steps processed: {len(steps)}")
+    print(f"Target max pruning ratio: {target_max_ratio * 100:.2f}%")
 
 if __name__ == "__main__":
     try:
-        data_steps, data_losses, data_lrs, data_alphas = parse_training_log(LOG_PATH)
-        generate_conference_plot(data_steps, data_losses, data_lrs, data_alphas)
+        data_steps, data_losses, data_lrs, data_pruning, max_pruning = parse_training_log(LOG_PATH)
+        generate_conference_plot(data_steps, data_losses, data_lrs, data_pruning, max_pruning)
     except Exception as e:
         print(f"Execution Failed: {e}")

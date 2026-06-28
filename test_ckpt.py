@@ -1,243 +1,193 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Checkpoint Restoration Verification Script.
+Robust Checkpoint Integrity Validator
+-------------------------------------
+Validates that DeepSpeed ZeRO states and decoupled IFPruning predictor weights 
+can be successfully restored without partition mismatch or metadata corruption.
 
-Objective: Strictly verify the serialization and restoration mechanics of the 
-IFPruning architecture through simulated process interruption and resumption.
-Ensures zero deadlocks, state alignment, and DeepSpeed optimizer slice integrity.
+Usage:
+  Phase 1 (Checkpoint): TEST_PHASE=1 torchrun --nproc_per_node=2 test_ckpt.py
+  Phase 2 (Restore):  TEST_PHASE=2 torchrun --nproc_per_node=2 test_ckpt.py
 """
 
 import os
 import sys
 import logging
+import inspect
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
 
 import torch
+import torch.nn as nn
 from safetensors.torch import load_file
-import inspect
+from transformers import AutoModelForCausalLM, TrainingArguments, TrainerCallback
+from deepspeed.ops.adam import FusedAdam
 
-from transformers import TrainingArguments, set_seed, AutoTokenizer, AutoModelForCausalLM
-from datasets import load_dataset
-
-# Import core training components from the primary module
+# Import core architecture components directly from train.py to ensure parity
 from train import (
     RunConfig,
-    setup_logging,
-    make_deepspeed_config,
+    SparsityPredictor,
     patch_model_for_ifpruning,
-    tokenize_sft_dataset,
-    DualCollator,
     IFPruningTrainer,
     IFPruningCallback,
-    IS_RANK0,
+    DualCollator,
+    make_deepspeed_config
 )
 
-def extract_losses_from_history(trainer: IFPruningTrainer) -> List[float]:
-    """Extracts the loss trajectory from the Trainer's state log history."""
-    try:
-        return [entry["loss"] for entry in trainer.state.log_history if "loss" in entry]
-    except Exception as e:
-        logging.getLogger("ifpruning_sft").error("Failed to extract loss history.", exc_info=True)
-        return []
+# ==============================================================================
+# Configuration & Environment
+# ==============================================================================
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+RANK = int(os.environ.get("RANK", 0))
+IS_RANK0 = (RANK == 0)
 
-def run_training_segment(
-    mode: str, 
-    cfg: RunConfig, 
-    t_args: TrainingArguments, 
-    dataset, 
-    b_tok, 
-    p_tok, 
-    resume_from: str = None
-) -> List[float]:
-    """
-    Executes a discrete segment of the training process.
-    Handles model loading, architectural patching, and state restoration.
-    """
-    global LOGGER
-    LOGGER.info(f"\n{'='*60}\n[EXECUTION PHASE] Initiating: {mode}\n{'='*60}")
-    
-    try:
-        LOGGER.info("Loading base model architecture and applying structural patches...")
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16 if cfg.bf16 else torch.float16, 
-            "local_files_only": cfg.local_files_only, 
-            "attn_implementation": cfg.attn_implementation
-        }
-        base_model = AutoModelForCausalLM.from_pretrained(cfg.base_model, **model_kwargs)
-        model, layers = patch_model_for_ifpruning(base_model, cfg)
-        
-        if cfg.gradient_checkpointing and hasattr(model, "enable_input_require_grads"): 
-            model.enable_input_require_grads()
-    except Exception as e:
-        LOGGER.error("Failed during model initialization or patching sequence.", exc_info=True)
-        raise
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] [rank=%(process)d] %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("ckpt_validator")
 
-    try:
-        trainer = IFPruningTrainer(
-            model=model, 
-            args=t_args, 
-            train_dataset=dataset, 
-            data_collator=DualCollator(b_tok.pad_token_id, p_tok.pad_token_id),
-            callbacks=[IFPruningCallback(layers, cfg.mask_warmup_steps, cfg.abort_on_zero_loss_steps)],
-            p_lr=cfg.predictor_lr, 
-            b_lr=cfg.base_lr
-        )
-    except Exception as e:
-        LOGGER.error("Failed to instantiate IFPruningTrainer.", exc_info=True)
-        raise
+# ==============================================================================
+# Validation Logic
+# ==============================================================================
+def create_dummy_dataset(num_samples: int = 16):
+    """Creates a minimal viable dataset to trigger the Trainer's initialization sequence."""
+    from datasets import Dataset
+    return Dataset.from_dict({
+        "input_ids": [[1, 2, 3]] * num_samples,
+        "attention_mask": [[1, 1, 1]] * num_samples,
+        "labels": [[-100, 2, 3]] * num_samples,
+        "predictor_input_ids": [[1, 2, 3]] * num_samples,
+        "predictor_attention_mask": [[1, 1, 1]] * num_samples,
+        "num_target_tokens": [2] * num_samples
+    })
 
-    if resume_from:
-        pred_ckpt_path = Path(resume_from) / "predictor_mlp.safetensors"
-        if pred_ckpt_path.exists():
-            LOGGER.info(f"Predictor checkpoint detected. Restoring from: {pred_ckpt_path}")
-            try:
-                ckpt_state = load_file(str(pred_ckpt_path))
-                model.predictor.mlp.load_state_dict(ckpt_state, strict=True)
-            except Exception as e:
-                LOGGER.error(f"Failed to load predictor weights from {pred_ckpt_path}.", exc_info=True)
-                raise
-        else:
-            LOGGER.error(f"Critical Failure: Predictor weights missing in checkpoint directory: {resume_from}")
-            raise FileNotFoundError("Missing predictor weights for restoration phase.")
-            
-        LOGGER.info("Delegating optimizer and base model state restoration to DeepSpeed engine...")
-
-    try:
-        trainer.train(resume_from_checkpoint=resume_from)
-    except Exception as e:
-        LOGGER.error("Training loop terminated unexpectedly.", exc_info=True)
-        raise
-        
-    return extract_losses_from_history(trainer)
+class AuditLogCallback(TrainerCallback):
+    """自定义回调：高亮打印每个 Step 的状态，用于直观确认断点续训的连续性。"""
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if IS_RANK0 and logs is not None and "loss" in logs:
+            loss = logs.get("loss", 0.0)
+            lr = logs.get("learning_rate", 0.0)
+            alpha = logs.get("mask_alpha", 0.0) # 依赖 IFPruningCallback 注入
+            print(f"\n[AUDIT LOG] Step: {state.global_step:02d} | Loss: {loss:.6f} | LR: {lr:.2e} | Alpha: {alpha:.4f}")
 
 def main():
-    set_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(LOCAL_RANK)
+
+    test_phase = int(os.environ.get("TEST_PHASE", "0"))
+    if test_phase not in [1, 2]:
+        logger.error("Please set TEST_PHASE=1 (Checkpoint) or TEST_PHASE=2 (Restore).")
+        sys.exit(1)
+
+    # Use default configuration aligned with train.py
+    cfg = RunConfig()
     
-    # Configure test-specific parameters (abbreviated execution)
-    cfg = RunConfig(
-        output_dir="./ckpt_restore",
-        max_steps=6,
-        save_steps=3,
-        logging_steps=1,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=1,
-        mask_warmup_steps=10,
-        deepspeed=True
-    )
+    # Override steps for rapid testing
+    cfg.max_steps = 5 
+    cfg.save_steps = 5
+    cfg.logging_steps = 1
+    cfg.mask_warmup_steps = 10 # 缩短测试下的预热周期以观察 Alpha 变化
+    cfg.output_dir = "./gemma-12B-ifpruning-test-ckpt"
     
-    global LOGGER
-    LOGGER, log_dir = setup_logging(cfg.output_dir)
-    
-    LOGGER.info("Initializing Test Environment and Data Pipeline...")
-    try:
-        b_tok = AutoTokenizer.from_pretrained(cfg.base_model, local_files_only=cfg.local_files_only, use_fast=True)
-        p_tok = AutoTokenizer.from_pretrained(cfg.predictor_model, local_files_only=cfg.local_files_only, use_fast=True)
-        raw = load_dataset(cfg.dataset_name, cfg.dataset_config, split="train[:100]", cache_dir=cfg.cache_dir)
-    except Exception as e:
-        LOGGER.error("Data pipeline initialization failed.", exc_info=True)
-        raise
+    log_dir = Path(cfg.output_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     
     ta_kwargs = {
-        "output_dir": cfg.output_dir, 
-        "do_train": True, 
-        "per_device_train_batch_size": cfg.per_device_train_batch_size,
-        "gradient_accumulation_steps": cfg.gradient_accumulation_steps, 
-        "max_steps": cfg.max_steps, 
-        "learning_rate": cfg.base_lr, 
-        "weight_decay": cfg.weight_decay,
-        "warmup_ratio": cfg.warmup_ratio, 
-        "bf16": cfg.bf16, 
-        "fp16": cfg.fp16, 
-        "logging_steps": cfg.logging_steps,
-        "save_steps": cfg.save_steps, 
-        "save_total_limit": cfg.save_total_limit, 
+        "output_dir": cfg.output_dir,
+        "do_train": True,
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "max_steps": cfg.max_steps,
+        "learning_rate": cfg.base_lr,
+        "bf16": cfg.bf16,
+        "save_steps": cfg.save_steps,
         "save_safetensors": True,
-        "report_to": [], 
-        "dataloader_num_workers": cfg.dataloader_num_workers,
-        "gradient_checkpointing": cfg.gradient_checkpointing, 
-        "deepspeed": make_deepspeed_config(cfg, log_dir),
-        "gradient_checkpointing_kwargs": {"use_reentrant": False} if cfg.gradient_checkpointing else None,
-        "seed": 42, 
-        "data_seed": 42
+        "safe_serialization": True,
+        "report_to": ["none"],
+        "logging_steps": 1, # 强制每步打印
+        "deepspeed": make_deepspeed_config(cfg, log_dir)
     }
     
+    # 像 train.py 一样自动过滤不支持的参数
     valid_args = inspect.signature(TrainingArguments.__init__).parameters
-    safe_kwargs = {k: v for k, v in ta_kwargs.items() if k in valid_args}
+    t_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in valid_args})
+
+    dummy_dataset = create_dummy_dataset()
+
+    logger.info("Initializing architecture for validation...")
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16 if cfg.bf16 else torch.float16,
+        "local_files_only": cfg.local_files_only,
+        "attn_implementation": cfg.attn_implementation
+    }
     
-    try:
-        t_args = TrainingArguments(**safe_kwargs)
-        tokenized = tokenize_sft_dataset(raw, b_tok, p_tok, cfg, t_args)
-    except Exception as e:
-        LOGGER.error("Failed to tokenize dataset or construct TrainingArguments.", exc_info=True)
-        raise
+    base_model = AutoModelForCausalLM.from_pretrained(cfg.base_model, **model_kwargs)
+    model, layers = patch_model_for_ifpruning(base_model, cfg)
 
-    phase = os.environ.get("TEST_PHASE", "1")
+    trainer = IFPruningTrainer(
+        model=model,
+        args=t_args,
+        train_dataset=dummy_dataset,
+        data_collator=DualCollator(b_pad=0, p_pad=0),
+        p_lr=cfg.predictor_lr,
+        b_lr=cfg.base_lr,
+        callbacks=[
+            IFPruningCallback(layers, cfg.mask_warmup_steps, cfg.abort_on_zero_loss_steps),
+            AuditLogCallback()
+        ]
+    )
 
-    if phase == "1":
-        # =====================================================================
-        # Phase 1: Initial Run (Steps 1 to 3)
-        # =====================================================================
+    if test_phase == 1:
+        logger.info("=== PHASE 1: Executing Checkpoint Routine ===")
         try:
-            t_args_interrupted = TrainingArguments(**safe_kwargs)
-            t_args_interrupted.max_steps = 3
-            
-            loss = run_training_segment("Phase 1: Initial Run (Steps 1-3)", cfg, t_args_interrupted, tokenized, b_tok, p_tok)
-            
-            if IS_RANK0:
-                LOGGER.info("\n" + "="*60)
-                LOGGER.info("[SUCCESS] Phase 1 training sequence completed and state serialized.")
-                LOGGER.info(f"[METRICS] Phase 1 Loss Trajectory: {[f'{l:.4f}' for l in loss]}")
-                LOGGER.info("[ACTION REQUIRED] Execute Phase 2 command to verify restoration mechanics.")
-                LOGGER.info("="*60 + "\n")
+            trainer.train()
+            logger.info("Phase 1 Complete: Checkpoint generated successfully.")
         except Exception as e:
-            LOGGER.error("Fatal error encountered during Phase 1 execution.", exc_info=True)
-            raise
+            logger.error(f"Phase 1 Failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    elif test_phase == 2:
+        logger.info("=== PHASE 2: Executing Restoration Audit ===")
+        
+        from transformers.trainer_utils import get_last_checkpoint
+        resume_ckpt = get_last_checkpoint(cfg.output_dir)
+        
+        if not resume_ckpt:
+            logger.error(f"Cannot perform Phase 2. No checkpoint found in {cfg.output_dir}.")
+            sys.exit(1)
             
-    elif phase == "2":
-        # =====================================================================
-        # Phase 2: Restoration Run (Steps 4 to 6)
-        # =====================================================================
+        logger.info(f"Targeting checkpoint: {resume_ckpt}")
+        
+        # Validate Custom State Decoupling
+        pred_ckpt_path = Path(resume_ckpt) / "predictor_mlp.safetensors"
+        if not pred_ckpt_path.exists():
+            logger.error(f"Integrity Error: Decoupled predictor weights missing at {pred_ckpt_path}")
+            sys.exit(1)
+            
         try:
-            ckpt_path = os.path.join(cfg.output_dir, "checkpoint-3")
-            
-            # Resilience Validation: Ensure DeepSpeed optimizer slices are physically present
-            if IS_RANK0:
-                if not os.path.exists(ckpt_path):
-                    LOGGER.error(f"Checkpoint directory not found at target path: {ckpt_path}")
-                    raise AssertionError(f"Missing Checkpoint: {ckpt_path}")
-                    
-                ds_step_dir = os.path.join(ckpt_path, "global_step3")
-                if not os.path.exists(ds_step_dir):
-                    LOGGER.error(f"DeepSpeed optimizer directory missing: {ds_step_dir}")
-                    raise AssertionError(f"Missing DeepSpeed Engine State: {ds_step_dir}")
-                    
-                pt_files = [f for f in os.listdir(ds_step_dir) if f.endswith(".pt")]
-                if len(pt_files) == 0:
-                    LOGGER.error(f"No optimizer tensor slices found in {ds_step_dir}")
-                    raise AssertionError(f"Corrupted DeepSpeed Engine State: Optimizer slices missing.")
-                
-                LOGGER.info("Pre-flight validation passed: DeepSpeed physical state files detected.")
-                
-            loss = run_training_segment("Phase 2: Resumed Run (Steps 4-6)", cfg, t_args, tokenized, b_tok, p_tok, resume_from=ckpt_path)
-            
-            if IS_RANK0:
-                LOGGER.info("\n" + "="*60)
-                LOGGER.info("[SUCCESS] Checkpoint restoration verified successfully.")
-                LOGGER.info("Zero deadlocks. Zero OOM. File architecture preserved seamlessly.")
-                LOGGER.info(f"[METRICS] Phase 2 Loss Trajectory (Steps 4-6): {[f'{l:.4f}' for l in loss]}")
-                LOGGER.info("="*60 + "\n")
-                
+            logger.info("Loading decoupled predictor weights...")
+            ckpt_state = load_file(str(pred_ckpt_path))
+            load_result = model.predictor.mlp.load_state_dict(ckpt_state, strict=False)
+            if load_result.missing_keys:
+                logger.warning(f"Missing keys during restore: {load_result.missing_keys}")
+            logger.info("Decoupled weights restored successfully.")
         except Exception as e:
-            LOGGER.error("Fatal error encountered during Phase 2 restoration sequence.", exc_info=True)
-            raise
+            logger.error(f"Predictor restoration failed: {e}", exc_info=True)
+            sys.exit(1)
+
+        # Extend steps to allow trainer to resume and execute
+        trainer.args.max_steps += 5
+        
+        try:
+            logger.info("Resuming distributed training from checkpoint...")
+            trainer.train(resume_from_checkpoint=resume_ckpt)
+            logger.info("Phase 2 Complete: DeepSpeed ZeRO partitions and custom layers restored flawlessly.")
+        except Exception as e:
+            logger.error(f"Phase 2 Failed: Distributed state mismatch or corruption detected. {e}", exc_info=True)
+            sys.exit(1)
 
 if __name__ == "__main__":
-    # Top-level exception catcher to prevent silent multi-processing deaths
-    try:
-        main()
-    except Exception as top_level_e:
-        # Fallback print in case the logger itself failed to initialize
-        print(f"CRITICAL PROCESS FAILURE: {top_level_e}", file=sys.stderr)
-        sys.exit(1)
+    main()

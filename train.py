@@ -15,11 +15,9 @@ Objective: Implement the Supervised Fine-Tuning (SFT) phase of IFPruning.
 import os
 import argparse
 import inspect
-import datetime as _dt
 import json
 import logging
 import math
-import shutil
 import signal
 import sys
 import types
@@ -43,6 +41,8 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
+
+LOGGER = logging.getLogger("ifpruning_sft")
 
 # =============================================================================
 # 0. Distributed Environment & Logging Initialization
@@ -68,8 +68,7 @@ class RankFilter(logging.Filter):
 
 def setup_logging(output_dir: str, log_level: str = "INFO") -> Tuple[logging.Logger, Path]:
     """Initializes a concurrent-safe logging directory and logger instance."""
-    out = Path(output_dir)
-    log_dir = out / "logs"
+    log_dir = Path(output_dir) / "logs"
     
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +78,7 @@ def setup_logging(output_dir: str, log_level: str = "INFO") -> Tuple[logging.Log
 
     if not log_dir.is_dir():
         raise RuntimeError(f"Expected directory, but found file at: {log_dir!s}")
-        
+    
     logger = logging.getLogger("ifpruning_sft")
     logger.handlers.clear()
     logger.propagate = False
@@ -107,8 +106,6 @@ def setup_logging(output_dir: str, log_level: str = "INFO") -> Tuple[logging.Log
         logger.addHandler(sh)
 
     return logger, log_dir
-
-LOGGER = logging.getLogger("ifpruning_sft")
 
 def rank0_json_dump(path: Path, obj: Any) -> None:
     """Safely dumps JSON objects strictly on Rank 0 to prevent file corruption."""
@@ -173,13 +170,9 @@ class RunConfig:
     dataloader_num_workers: int = 2
     preprocessing_num_proc: int = 8
     preprocessing_batch_size: int = 1000
-    sanity_sample_count: int = 128
     seed: int = 42
     report_to: str = "none"
     resume: str = "auto"
-    prompt_template: str = "auto"
-    gemma_user_role: str = "user"
-    gemma_assistant_role: str = "model"
 
 def parse_args() -> RunConfig:
     """Parses command-line arguments mapped to the RunConfig dataclass."""
@@ -197,12 +190,8 @@ def make_deepspeed_config(cfg: RunConfig, log_dir: Path) -> Optional[str]:
         return None
         
     ds = {
-        "bf16": {
-            "enabled": bool(cfg.bf16)
-        },
-        "fp16": {
-            "enabled": bool(cfg.fp16)
-        },
+        "bf16": {"enabled": bool(cfg.bf16)},
+        "fp16": {"enabled": bool(cfg.fp16)},
         "zero_optimization": {
             "stage": cfg.zero_stage,
             "overlap_comm": True,
@@ -650,8 +639,8 @@ class DualCollator:
                 "input_ids": torch.tensor([pad(x["input_ids"], mb, self.b_pad) for x in features], dtype=torch.long),
                 "attention_mask": torch.tensor([pad(x["attention_mask"], mb, 0) for x in features], dtype=torch.long),
                 "labels": torch.tensor([pad(x["labels"], mb, -100) for x in features], dtype=torch.long),
-                "predictor_input_ids": torch.tensor([pad(x["predictor_input_ids"], mp, self.p_pad) for x in features], dtype=torch.long),
-                "predictor_attention_mask": torch.tensor([pad(x["predictor_attention_mask"], mp, 0) for x in features], dtype=torch.long),
+                "predictor_input_ids": torch.tensor([pad(x.get("predictor_input_ids", []), mp, self.p_pad) for x in features], dtype=torch.long),
+                "predictor_attention_mask": torch.tensor([pad(x.get("predictor_attention_mask", []), mp, 0) for x in features], dtype=torch.long),
             }
         except Exception as e:
             LOGGER.error(f"Collation failed during batch formation. Exception: {e}", exc_info=True)
@@ -735,7 +724,7 @@ class IFPruningCallback(TrainerCallback):
             else:
                 self.zero_streak = 0
             
-        if IS_RANK0 and "loss" in logs:
+        if "loss" in logs:
             logs["mask_alpha"] = float(self.layers[0].mlp.mask_alpha.item()) if self.layers else 0.0
             LOGGER.info(
                 f"Step {state.global_step} | "
@@ -756,12 +745,6 @@ def main():
     LOGGER, log_dir = setup_logging(cfg.output_dir)
     set_seed(cfg.seed)
 
-    def sig_handler(s, f):
-        sys.exit(0)
-        
-    signal.signal(signal.SIGTERM, sig_handler)
-    signal.signal(signal.SIGINT, sig_handler)
-
     rank0_json_dump(log_dir / "run_config.json", asdict(cfg))
 
     ta_kwargs = {
@@ -779,7 +762,7 @@ def main():
         "logging_steps": cfg.logging_steps,
         "save_steps": cfg.save_steps,
         "save_total_limit": cfg.save_total_limit,
-        "safe_serialization": True, # FIXED: Replaced save_safetensors with safe_serialization
+        "safe_serialization": True,
         "report_to": [] if cfg.report_to == "none" else cfg.report_to.split(","),
         "dataloader_num_workers": cfg.dataloader_num_workers,
         "gradient_checkpointing": cfg.gradient_checkpointing,
@@ -826,7 +809,6 @@ def main():
         
         tokenized_dataset = concatenate_datasets([alpaca_tok, hermes_tok]).shuffle(seed=cfg.seed)
         LOGGER.info(f"Dataset preparation complete. Total blended samples: {len(tokenized_dataset)}")
-        # ---------------------------------------------------------
         
     except Exception as e:
         LOGGER.error("Failed during Tokenizer initialization or Dataset loading.", exc_info=True)

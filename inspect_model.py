@@ -2,7 +2,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoConfig
 
 # 本地模型路径
-MODEL_PATH = "./gemma-4-12b"
+MODEL_PATH = "./gemma-4-12B"
 
 def inspect_model_structure(model_path):
     try:
@@ -31,11 +31,11 @@ def inspect_model_structure(model_path):
     )
 
     print("\n========== 2. 宏观物理结构树 ==========")
-    # 直接 print 模型，可以看到类似系统文件夹的嵌套结构
+    # 直接 print 模型，可看到类似系统文件夹的嵌套结构
     print(model)
 
     print("\n========== 3. 模块绝对路径 ==========")
-    # 遍历并过滤出我们最关心的模块（比如 layers 和 mlp）
+    # 遍历并过滤出关心的模块（比如 layers 和 mlp）
     layer_count = 0
     mlp_paths = []
     
@@ -59,7 +59,7 @@ def inspect_model_structure(model_path):
         print("   - ... (中间省略) ...")
         print(f"   - 路径: {mlp_paths[-1][0]} ---> 类型: {mlp_paths[-1][1]}")
     else:
-        print("\n❌ 未能按常规命名找到 mlp 模块，请检查上方宏观结构树。")
+        print("\nError! 未能按常规命名找到 mlp 模块，请检查上方宏观结构树。")
 
 if __name__ == "__main__":
     inspect_model_structure(MODEL_PATH)

@@ -17,9 +17,11 @@ alpaca-cleaned/
 OpenHermes-2.5/
 hf_cache/
 
-# 4. 训练输出目录 (Checkpoint、Logs、DeepSpeed States)
-gemma-12b-ifpruning-output/
-test_restore_output/
+# 4. 输出目录 (Checkpoint、Logs、DeepSpeed States)
+gemma-12B-ifpruning-test-ckpt/
+gemma-12B-ifpruning-output/
+gemma-12B-ifpruning/
+routing_scores/
 *.log
 
 # 5. 系统与编辑器文件

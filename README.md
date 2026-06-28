@@ -94,13 +94,10 @@ torchrun --nproc_per_node=2 train.py
 
 ### 6.2 Inference
 
-Use `inference_IFP.py` to deploy the pruned model. The predictor injects dynamic masks based on input prompt semantics.
+Use `inference_IFP.py` to deploy the pruned model in an interactive terminal shell. The predictor dynamically injects sparsity masks based on the semantics of each prompt you type. Ensure the paths in `inference_IFP.py` (`BASE_MODEL_PATH`, `PREDICTOR_MODEL_PATH`, `CHECKPOINT_DIR`) correctly point to your local directories, then launch the interactive shell:
 
 ```bash
-python inference_IFP.py \
-    --base_model "./gemma-4-12b" \
-    --ckpt_dir "./gemma-12b-ifpruning-output" \
-    --prompt "Explain quantum entanglement like I'm five."
+python inference_IFP.py
 ```
 
 ### 6.3 Checkpoint and Restore
