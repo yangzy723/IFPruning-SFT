@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IFPruning SFT Training Dynamics Visualizer
+IFPruning SFT Training Dynamics Visualizer (Conference Optimized)
 """
 
 import re
@@ -14,7 +14,7 @@ OUTPUT_PATH = Path("./loss_curve.png")
 
 SMOOTHING_WEIGHT = 0.75
 
-# 请根据实际使用的模型修改 ORIGINAL_FFN_DIM (例如 Gemma-4-12b 为 14336)
+# 请根据实际使用的模型修改 ORIGINAL_FFN_DIM (例如 Gemma-4-12B 为 14336)
 ORIGINAL_FFN_DIM = 14336 
 TARGET_FFN_DIM = 4096
 
@@ -55,21 +55,21 @@ def compute_ema(values, weight=0.85):
 # 3. 绘图风格
 def set_academic_style():
     plt.rcParams.update({
-        "font.family": "serif",           # 使用衬线字体
+        "font.family": "serif",
         "font.serif": ["Times New Roman", "DejaVu Serif"],
-        "font.size": 14,                  # 基础字号放大
-        "axes.labelsize": 16,             # 坐标轴标签字号
-        "axes.titlesize": 16,             # 子图标题字号
-        "legend.fontsize": 12,            # 图例字号
-        "xtick.labelsize": 13,            # X轴刻度字号
-        "ytick.labelsize": 13,            # Y轴刻度字号
-        "xtick.direction": "in",          # 刻度朝内
-        "ytick.direction": "in",          # 刻度朝内
-        "axes.linewidth": 1.2,            # 边框加粗
-        "lines.linewidth": 2.0,           # 默认线条加粗
-        "figure.facecolor": "white",      # 纯白背景
-        "axes.facecolor": "white",        # 纯白绘图区
-        "grid.alpha": 0.5,                # 弱化网格
+        "font.size": 14,
+        "axes.labelsize": 16,
+        "axes.titlesize": 16,
+        "legend.fontsize": 12,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "axes.linewidth": 1.5,
+        "lines.linewidth": 2.0,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "grid.alpha": 0.4,
         "grid.linestyle": "--"
     })
 
@@ -82,47 +82,57 @@ def generate_conference_plot(steps, losses, lrs, pruning_ratios, target_max_rati
         figsize=(10, 8), 
         dpi=300, 
         sharex=True, 
-        gridspec_kw={'height_ratios': [2, 1]}
+        gridspec_kw={'height_ratios': [2.2, 1]}
     )
     
-    # 全封闭边框与网格
-    for ax in (ax1, ax2):
-        ax.grid(True)
-        for spine in ax.spines.values():
-            spine.set_color('black')
-
     # ------------------ 顶部子图: Loss ------------------
     smooth_losses = compute_ema(losses, weight=SMOOTHING_WEIGHT)
 
-    ax1.plot(steps, losses, color="#004C99", linewidth=2, linestyle=":", alpha=0.75, label="Batch Loss")
-    ax1.plot(steps, smooth_losses, color="#C00000", linewidth=2, linestyle="-", label="Smoothed Loss")
+    line1 = ax1.plot(steps, losses, color="#004C99", linewidth=1.5, linestyle=":", alpha=0.6, label="Batch Loss")
+    line2 = ax1.plot(steps, smooth_losses, color="#C00000", linewidth=2, linestyle="-", label="Smoothed Loss")
     
     ax1.set_ylabel("Cross Entropy Loss")
+    ax1.grid(True)
+    for spine in ax1.spines.values():
+        spine.set_color('black')
 
     # ------------------ 底部子图: LR & Sparsity ------------------
-    ax2.plot(steps, lrs, color="#548235", linewidth=2.0, linestyle="-", label="Learning Rate")
+    line3 = ax2.plot(steps, lrs, color="#548235", linewidth=2.0, linestyle="-", label="Learning Rate")
     ax2.set_xlabel("Training Steps")
-    ax2.set_ylabel("Learning Rate")
+    ax2.set_ylabel("Learning Rate", color="#548235") 
+    ax2.tick_params(axis='y', labelcolor="#548235")
+    ax2.grid(True)
+    
+    # 获取 LR 的最大值以设置合理的 Y 轴上限
+    max_lr = max(lrs)
+    ax2.set_ylim(0.0, max_lr * 1.1)
 
+    ax2.ticklabel_format(axis='y', style='sci', scilimits=(0,0), useMathText=True)
+    ax2.yaxis.get_offset_text().set_color("#548235")
+
+    # 次坐标轴 (Effective Sparsity)
     ax3 = ax2.twinx()
-    ax3.plot(steps, pruning_ratios, color="#7030A0", linewidth=2.0, linestyle="--", label="Effective Sparsity")
-    ax3.set_ylabel("Effective Pruning Ratio")
+    line4 = ax3.plot(steps, pruning_ratios, color="#7030A0", linewidth=2.0, linestyle="--", label="Effective Sparsity")
+    ax3.set_ylabel("Effective Pruning Ratio", color="#7030A0", rotation=-90, va="bottom", labelpad=15)
+    ax3.tick_params(axis='y', labelcolor="#7030A0")
     
     ax3.set_ylim(0.0, 1.0) 
     ax3.tick_params(direction="in")
 
-    lines_1, labels_1 = ax1.get_legend_handles_labels()
-    lines_2, labels_2 = ax2.get_legend_handles_labels()
-    lines_3, labels_3 = ax3.get_legend_handles_labels()
+    for spine in ax2.spines.values():
+        spine.set_color('black')
+
+    # ------------------ 合并图例 ------------------
+    lines = line1 + line2 + line3 + line4
+    labels = [l.get_label() for l in lines]
     
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.92, hspace=0.08) 
+    fig.subplots_adjust(top=0.88, hspace=0.1) 
     
     fig.legend(
-        lines_1 + lines_2 + lines_3, 
-        labels_1 + labels_2 + labels_3, 
+        lines, 
+        labels, 
         loc="upper center", 
-        bbox_to_anchor=(0.5, 0.99), 
+        bbox_to_anchor=(0.5, 0.96),
         ncol=4, 
         frameon=True, 
         edgecolor="black", 
@@ -130,7 +140,7 @@ def generate_conference_plot(steps, losses, lrs, pruning_ratios, target_max_rati
         framealpha=1.0
     )
 
-    fig.savefig(OUTPUT_PATH, bbox_inches='tight')
+    fig.savefig(OUTPUT_PATH, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
     print(f"Academic plot generated: {OUTPUT_PATH}")

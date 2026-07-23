@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IFPruning SFT Inference Pipeline
+IFPruning SFT Inference Pipeline (Layer-wise Routing Aligned)
 Supports interactive terminal chat and exports routing scores for visualization.
 """
 
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import math
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from transformers.models.gemma.modeling_gemma import GemmaMLP
 from safetensors.torch import load_file
@@ -21,7 +22,7 @@ from safetensors.torch import load_file
 # ==============================================================================
 BASE_MODEL_PATH = "./gemma-4-12B"
 PREDICTOR_MODEL_PATH = "./Qwen3.5-0.8B"
-CHECKPOINT_DIR = "./gemma-12B-ifpruning" 
+CHECKPOINT_DIR = "./gemma-12B-ifpruning-output" 
 TARGET_SPARSE_DIM = 4096
 
 # 用于保存 Score
@@ -40,10 +41,10 @@ logger = logging.getLogger("ifpruning_inference")
 # Module 1 & 2: Architecture & Wrapper
 # ==============================================================================
 class SparsityPredictor(nn.Module):
-    def __init__(self, target_num_layers: int, target_ffn_dim: int, extractor_path: str):
+    def __init__(self, num_layers: int, ffn_dim: int, extractor_path: str):
         super().__init__()
-        self.num_layers = target_num_layers
-        self.ffn_dim = target_ffn_dim
+        self.num_layers = num_layers
+        self.ffn_dim = ffn_dim
         
         self.feature_extractor = AutoModel.from_pretrained(
             extractor_path, torch_dtype=torch.bfloat16, local_files_only=True
@@ -59,10 +60,11 @@ class SparsityPredictor(nn.Module):
         if extractor_hidden_dim is None:
             extractor_hidden_dim = self.feature_extractor.get_input_embeddings().weight.shape[1]
 
+        # 对齐训练端的 2 层 MLP 架构
         self.mlp = nn.Sequential(
-            nn.Linear(extractor_hidden_dim, 128),
+            nn.Linear(extractor_hidden_dim, 384),
             nn.GELU(),
-            nn.Linear(128, target_num_layers * target_ffn_dim)
+            nn.Linear(384, self.num_layers * self.ffn_dim)
         )
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -79,6 +81,7 @@ class GemmaDynamicMaskedFFN_Inference(nn.Module):
         self.down_proj = original_mlp.down_proj
         self.act_fn = original_mlp.act_fn 
         self.target_ffn_dim = target_ffn_dim
+        self.full_ffn_dim = int(getattr(self.gate_proj, "out_features"))
         self.layer_scores = None 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,9 +93,11 @@ class GemmaDynamicMaskedFFN_Inference(nn.Module):
             _, topk_idx = torch.topk(scores, self.target_ffn_dim, dim=-1)
             indicator = torch.zeros_like(scores).scatter_(-1, topk_idx, 1.0)
             mask = indicator.unsqueeze(1) 
-            activated_hidden = (gate_out * up_out) * mask
+            scale_factor = math.sqrt(max(1.0, self.full_ffn_dim / max(1, self.target_ffn_dim)))
+            activated_hidden = (gate_out * up_out) * mask * scale_factor
         else:
             activated_hidden = gate_out * up_out
+            
         return self.down_proj(activated_hidden)
 
 class GemmaIFPruningWrapper(nn.Module):
@@ -100,7 +105,10 @@ class GemmaIFPruningWrapper(nn.Module):
         super().__init__()
         self.base_model = base_model
         cfg = getattr(base_model.config, "text_config", base_model.config)
-        self.predictor = SparsityPredictor(cfg.num_hidden_layers, cfg.intermediate_size, extractor_path)
+        
+        self.predictor = SparsityPredictor(
+            cfg.num_hidden_layers, cfg.intermediate_size, extractor_path
+        )
         
         target_device = next(base_model.parameters()).device
         self.predictor.to(device=target_device, dtype=base_model.dtype)
@@ -122,6 +130,7 @@ class GemmaIFPruningWrapper(nn.Module):
             p_mask = predictor_attention_mask.to(target_device)
             
             all_layer_scores = self.predictor(p_ids, p_mask)
+            
             for i, layer in enumerate(self.llm_layers):
                 layer.mlp.layer_scores = all_layer_scores[:, i, :]
             
@@ -160,7 +169,9 @@ def main():
         pass
 
     logger.info("Injecting dynamic activation sparsity architecture...")
-    model = GemmaIFPruningWrapper(base_model, TARGET_SPARSE_DIM, str(predictor_model_path))
+    model = GemmaIFPruningWrapper(
+        base_model, TARGET_SPARSE_DIM, str(predictor_model_path)
+    )
 
     logger.info("Restoring decoupled predictor parameters from safetensors...")
     pred_state_dict = load_file(str(predictor_weights_path))
@@ -211,7 +222,7 @@ def main():
             
             torch.save({
                 "prompt": instruction,
-                "scores": scores_tensor.squeeze(0).float() # 保存为 [L, D] 的 float32 矩阵
+                "scores": scores_tensor.squeeze(0).float() # 完整的 [真实层数, D] 矩阵
             }, save_path)
             
             print(f"[*] Routing scores saved to: ./routing_scores/{file_name}")

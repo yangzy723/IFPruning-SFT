@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IFPruning FFN Routing Visualizer
+IFPruning FFN Routing Visualizer (Layer-wise Routing Aligned)
 Compares the activation sparsity patterns of two different prompts.
 """
 
 import sys
 import torch
 import argparse
-from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+# ==============================================================================
+# Global Configuration
+# ==============================================================================
 TARGET_DIM = 4096
 
 def set_academic_style():
@@ -21,8 +23,8 @@ def set_academic_style():
         "font.size": 12,
         "axes.labelsize": 14,
         "axes.titlesize": 14,
-        "xtick.direction": "out",
-        "ytick.direction": "out",
+        "xtick.direction": "in",
+        "ytick.direction": "in",
         "figure.facecolor": "white",
         "axes.facecolor": "white",
     })
@@ -58,18 +60,18 @@ def main():
     prompt1 = data1["prompt"][:60] + "..." if len(data1["prompt"]) > 60 else data1["prompt"]
     prompt2 = data2["prompt"][:60] + "..." if len(data2["prompt"]) > 60 else data2["prompt"]
     
-    # Shape: [num_layers, ffn_dim]
+    # 形状：[num_layers, ffn_dim]
     s1 = data1["scores"]
     s2 = data2["scores"]
     
     if s1.shape != s2.shape:
-        raise ValueError("Score matrices shapes do not match!")
+        raise ValueError(f"Score matrices shapes do not match! s1: {s1.shape}, s2: {s2.shape}")
         
     num_layers, ffn_dim = s1.shape
     
-    # Apply Sigmoid to normalize scores to [0, 1] for better visualization
-    s1_norm = torch.sigmoid(s1).numpy()
-    s2_norm = torch.sigmoid(s2).numpy()
+    # 平滑温度为 0.2，准确反映训练时的路由分布硬度
+    s1_norm = torch.sigmoid(s1 / 0.2).numpy()
+    s2_norm = torch.sigmoid(s2 / 0.2).numpy()
     diff = np.abs(s1_norm - s2_norm)
     
     # Compute Layer-wise IoU

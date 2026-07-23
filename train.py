@@ -145,8 +145,8 @@ class RunConfig:
     gradient_accumulation_steps: int = 4
     num_train_epochs: float = 1
     max_steps: int = -1
-    base_lr: float = 2e-6
-    predictor_lr: float = 1e-5
+    base_lr: float = 2e-5 
+    predictor_lr: float = 3e-5
     weight_decay: float = 0.0
     warmup_ratio: float = 0.03
     max_grad_norm: float = 1.0
@@ -172,7 +172,7 @@ class RunConfig:
     preprocessing_batch_size: int = 1000
     seed: int = 42
     report_to: str = "none"
-    resume: str = "auto"
+    resume: str = "none"
 
 def parse_args() -> RunConfig:
     """Parses command-line arguments mapped to the RunConfig dataclass."""
@@ -267,12 +267,12 @@ class SparsityPredictor(nn.Module):
             hidden_size = self.extractor.get_input_embeddings().weight.shape[1]
             
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, 128),
+            nn.Linear(hidden_size, 384),
             nn.GELU(),
-            nn.Linear(128, self.num_layers * self.ffn_dim)
+            nn.Linear(384, self.num_layers * self.ffn_dim)
         )
         
-        nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=1e-4)
+        nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def train(self, mode: bool = True):
@@ -347,6 +347,8 @@ class DynamicMaskedFFN(nn.Module):
         self.up_proj = mlp.up_proj
         self.down_proj = mlp.down_proj
         self.act_fn = mlp.act_fn
+        self.full_ffn_dim = int(getattr(self.gate_proj, "out_features"))
+        self.target_ffn_dim = int(target_dim)
         
         self.mask_op = BoundedSoftTopK(
             target_dim,
@@ -364,14 +366,19 @@ class DynamicMaskedFFN(nn.Module):
         if self.layer_scores is not None:
             mask = self.mask_op(self.layer_scores).to(dtype=hidden.dtype).unsqueeze(1)
             alpha_val = float(self.mask_alpha.item())
-            
-            # Defense mechanism: Break computation graph deadlocks when alpha=0
-            if alpha_val >= 1.0: 
-                hidden = hidden * mask
-            elif alpha_val <= 0.0: 
+
+            # Dimension-aware rescale to keep activation magnitude stable after pruning.
+            scale_factor = math.sqrt(max(1.0, self.full_ffn_dim / max(1, self.target_ffn_dim)))
+
+            if alpha_val >= 1.0:
+                hidden = (hidden * mask) * scale_factor
+            elif alpha_val <= 0.0:
                 hidden = hidden + (mask * 0.0).to(hidden.dtype)
-            else: 
-                hidden = hidden.mul(1.0 - alpha_val).add(hidden.mul(mask), alpha=alpha_val)
+            else:
+                # Correct warmup interpolation: alpha mixes dense and sparse paths.
+                dense_part = hidden * (1.0 - alpha_val)
+                sparse_part = (hidden * mask) * (alpha_val * scale_factor)
+                hidden = dense_part + sparse_part
                 
         return self.down_proj(hidden)
 
