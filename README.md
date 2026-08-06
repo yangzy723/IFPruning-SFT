@@ -44,8 +44,8 @@ The predictor backbone, prediction head and masked LLM are optimized jointly.
 During training, the implementation follows the paper's soft masking form:
 
 $$
-\lambda = \operatorname{SoftTopK}(S, k), \qquad
-m = \lambda \odot \operatorname{Top}(\lambda, k).
+\lambda = \mathrm{SoftTopK}(S, k), \qquad
+m = \lambda \odot \mathrm{Top}(\lambda, k).
 $$
 
 The threshold used by `SoftTopK` is solved by binary search while preserving its implicit gradient. During validation and inference, the mask becomes an exact binary Top-K mask with exactly $k$ active FFN channels per layer.
@@ -55,16 +55,24 @@ The threshold used by `SoftTopK` is solved by binary search while preserving its
 For a gated FFN,
 
 $$
-H = \operatorname{Act}(XW_{\mathrm{gate}}) \odot XW_{\mathrm{up}},
+H = \mathrm{Act}(XW_{\mathrm{gate}}) \odot XW_{\mathrm{up}},
 $$
 
 the selected mask is applied before the down projection:
 
 $$
-Y = \left[(1-\alpha)H + \alpha(H \odot m)\right]W_{\mathrm{down}},
+Y =
+\left[
+(1-\alpha)H
++
+\alpha(H \odot m)
+\right]
+W_{\mathrm{down}},
 $$
 
-where $\alpha$ gradually moves training from the dense path to the sparse path. Validation always evaluates the fully sparse, hard-mask configuration used at deployment.
+where $\alpha$ gradually moves training from the dense path to the sparse
+path. Validation always evaluates the fully sparse, hard-mask configuration
+used at deployment.
 
 ## Repository layout
 
