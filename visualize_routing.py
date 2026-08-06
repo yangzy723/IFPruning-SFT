@@ -1,129 +1,105 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-IFPruning FFN Routing Visualizer (Layer-wise Routing Aligned)
-Compares the activation sparsity patterns of two different prompts.
-"""
+"""Compare the actual hard Top-K masks selected for two prompts."""
 
-import sys
-import torch
 import argparse
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
-# ==============================================================================
-# Global Configuration
-# ==============================================================================
-TARGET_DIM = 4096
 
-def set_academic_style():
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.serif": ["Times New Roman", "DejaVu Serif"],
-        "font.size": 12,
-        "axes.labelsize": 14,
-        "axes.titlesize": 14,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-    })
+def hard_topk_mask(scores: torch.Tensor, k: int) -> torch.Tensor:
+    if scores.ndim != 2:
+        raise ValueError(f"Expected [layers, channels] scores, got {tuple(scores.shape)}")
+    if not 0 < k <= scores.shape[-1]:
+        raise ValueError(f"target_dim={k} must be in [1, {scores.shape[-1]}]")
+    indices = torch.topk(scores.float(), k, dim=-1).indices
+    return torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, indices, True)
 
-def compute_routing_iou(score1: torch.Tensor, score2: torch.Tensor, k: int) -> np.ndarray:
-    """Computes the Intersection over Union (IoU) of top-K channels per layer."""
-    num_layers = score1.shape[0]
-    ious = np.zeros(num_layers)
-    
-    for i in range(num_layers):
-        _, topk_idx1 = torch.topk(score1[i], k, dim=-1)
-        _, topk_idx2 = torch.topk(score2[i], k, dim=-1)
-        
-        set1 = set(topk_idx1.tolist())
-        set2 = set(topk_idx2.tolist())
-        
-        intersection = len(set1.intersection(set2))
-        union = len(set1.union(set2))
-        ious[i] = intersection / union if union > 0 else 0
-        
-    return ious
+
+def layer_overlap(mask_a: torch.Tensor, mask_b: torch.Tensor, k: int) -> np.ndarray:
+    """Paper-style overlap: shared selected channels divided by K."""
+    return ((mask_a & mask_b).sum(dim=-1).float() / k).cpu().numpy()
+
+
+def short_prompt(prompt: str) -> str:
+    return prompt if len(prompt) <= 60 else prompt[:60] + "..."
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("file1", type=str, help="Path to first prompt score (.pt)")
-    parser.add_argument("file2", type=str, help="Path to second prompt score (.pt)")
+    parser.add_argument("file1", help="First routing score .pt file")
+    parser.add_argument("file2", help="Second routing score .pt file")
+    parser.add_argument("--target-dim", type=int, default=4096)
+    parser.add_argument("--output", default="figs/routing_comparison.png")
     args = parser.parse_args()
 
-    # 1. Load Data
-    data1 = torch.load(args.file1, map_location="cpu")
-    data2 = torch.load(args.file2, map_location="cpu")
-    
-    prompt1 = data1["prompt"][:60] + "..." if len(data1["prompt"]) > 60 else data1["prompt"]
-    prompt2 = data2["prompt"][:60] + "..." if len(data2["prompt"]) > 60 else data2["prompt"]
-    
-    # 形状：[num_layers, ffn_dim]
-    s1 = data1["scores"]
-    s2 = data2["scores"]
-    
-    if s1.shape != s2.shape:
-        raise ValueError(f"Score matrices shapes do not match! s1: {s1.shape}, s2: {s2.shape}")
-        
-    num_layers, ffn_dim = s1.shape
-    
-    # 平滑温度为 0.2，准确反映训练时的路由分布硬度
-    s1_norm = torch.sigmoid(s1 / 0.2).numpy()
-    s2_norm = torch.sigmoid(s2 / 0.2).numpy()
-    diff = np.abs(s1_norm - s2_norm)
-    
-    # Compute Layer-wise IoU
-    ious = compute_routing_iou(s1, s2, TARGET_DIM)
-    
-    # 2. Plotting
-    set_academic_style()
-    fig = plt.figure(figsize=(14, 10), dpi=300)
-    gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], width_ratios=[3, 1])
-    
-    # Heatmap 1
-    ax1 = fig.add_subplot(gs[0, 0])
-    im1 = ax1.imshow(s1_norm, aspect='auto', cmap='viridis', interpolation='none')
-    ax1.set_title(f"Prompt A Routing Scores\n'{prompt1}'", pad=10)
-    ax1.set_ylabel("Layer Depth")
-    
-    # Heatmap 2
-    ax2 = fig.add_subplot(gs[1, 0])
-    im2 = ax2.imshow(s2_norm, aspect='auto', cmap='viridis', interpolation='none')
-    ax2.set_title(f"Prompt B Routing Scores\n'{prompt2}'", pad=10)
-    ax2.set_ylabel("Layer Depth")
-    
-    # Heatmap Diff
-    ax3 = fig.add_subplot(gs[2, 0])
-    im3 = ax3.imshow(diff, aspect='auto', cmap='magma', interpolation='none')
-    ax3.set_title("Absolute Difference |A - B|", pad=10)
-    ax3.set_ylabel("Layer Depth")
-    ax3.set_xlabel("FFN Channel Index")
-    
-    # Add colorbars for heatmaps
-    fig.colorbar(im1, ax=ax1, fraction=0.02, pad=0.02)
-    fig.colorbar(im2, ax=ax2, fraction=0.02, pad=0.02)
-    fig.colorbar(im3, ax=ax3, fraction=0.02, pad=0.02)
-    
-    # Line Chart: IoU
-    ax_iou = fig.add_subplot(gs[:, 1])
-    ax_iou.plot(ious, range(num_layers), marker='o', markersize=5, color="#C00000", linewidth=2)
-    ax_iou.set_ylim(num_layers - 0.5, -0.5) # Reverse Y axis to match heatmap layers
-    ax_iou.set_xlim(0.0, 1.0)
-    ax_iou.set_title(f"Routing Similarity (IoU)\nTop-{TARGET_DIM} Channels", pad=10)
-    ax_iou.set_xlabel("Intersection over Union")
-    ax_iou.grid(True, linestyle="--", alpha=0.6)
-    
-    # Highlight area of highest difference (lowest IoU)
-    min_iou_layer = np.argmin(ious)
-    ax_iou.axhline(y=min_iou_layer, color='blue', linestyle=':', alpha=0.5)
-    ax_iou.text(0.05, min_iou_layer - 0.5, f"Lowest Similarity\n(Layer {min_iou_layer})", color='blue', fontsize=10)
-    
-    plt.tight_layout()
-    output_filename = "routing_comparison.png"
-    plt.savefig(output_filename, bbox_inches='tight')
-    print(f"Visualization saved to: {output_filename}")
+    data_a = torch.load(args.file1, map_location="cpu", weights_only=True)
+    data_b = torch.load(args.file2, map_location="cpu", weights_only=True)
+    scores_a = data_a["scores"].float()
+    scores_b = data_b["scores"].float()
+    if scores_a.shape != scores_b.shape:
+        raise ValueError(f"Score shapes differ: {tuple(scores_a.shape)} vs {tuple(scores_b.shape)}")
+
+    mask_a = hard_topk_mask(scores_a, args.target_dim)
+    mask_b = hard_topk_mask(scores_b, args.target_dim)
+    difference = mask_a.logical_xor(mask_b)
+    overlaps = layer_overlap(mask_a, mask_b, args.target_dim)
+    num_layers = scores_a.shape[0]
+
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "DejaVu Serif"],
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "axes.titlesize": 14,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+        }
+    )
+    figure = plt.figure(figsize=(14, 10), dpi=300)
+    grid = figure.add_gridspec(3, 2, width_ratios=[3, 1])
+    panels = [
+        (mask_a, f"Prompt A hard Top-K mask\n'{short_prompt(data_a['prompt'])}'", "Greens"),
+        (mask_b, f"Prompt B hard Top-K mask\n'{short_prompt(data_b['prompt'])}'", "Greens"),
+        (difference, "Mask XOR difference", "magma"),
+    ]
+    for row, (values, title, color_map) in enumerate(panels):
+        axis = figure.add_subplot(grid[row, 0])
+        axis.imshow(
+            values.numpy(),
+            aspect="auto",
+            cmap=color_map,
+            interpolation="none",
+            vmin=0,
+            vmax=1,
+        )
+        axis.set_title(title)
+        axis.set_ylabel("Layer Depth")
+        if row == 2:
+            axis.set_xlabel("FFN Channel Index")
+
+    overlap_axis = figure.add_subplot(grid[:, 1])
+    overlap_axis.plot(overlaps, range(num_layers), marker="o", markersize=4, color="#C00000")
+    overlap_axis.set_ylim(num_layers - 0.5, -0.5)
+    overlap_axis.set_xlim(0.0, 1.0)
+    overlap_axis.set_title(f"Top-{args.target_dim} overlap")
+    overlap_axis.set_xlabel("Shared channels / K")
+    overlap_axis.grid(True, linestyle="--", alpha=0.6)
+
+    figure.tight_layout()
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(args.output, bbox_inches="tight")
+    print(f"Visualization saved to {args.output}")
+    print(
+        f"Layer overlap: mean={overlaps.mean():.4f}, "
+        f"min={overlaps.min():.4f}, max={overlaps.max():.4f}"
+    )
+    if np.all(overlaps > 0.999):
+        print("WARNING: every layer selects the same mask for both prompts")
+
 
 if __name__ == "__main__":
     main()

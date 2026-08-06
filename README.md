@@ -1,134 +1,374 @@
-# IFPruning-SFT: Unofficial Reproduction of AFM-3 Instruction-Following Pruning
+# IFPruning-SFT
 
-## 1. Overview
+> An unofficial, research-oriented implementation of the supervised fine-tuning stage from **Instruction-Following Pruning for Large Language Models**.
 
-This repository implements the Supervised Fine-Tuning (SFT) phase of the [Instruction-Following Pruning architecture (AFM-3)](https://arxiv.org/abs/2501.02086). IFPruning introduces input-aware activation sparsity into Large Language Models (LLMs) during the alignment phase.
+[GitHub Repository](https://github.com/yangzy723/IFPruning-SFT) · [Paper](https://arxiv.org/abs/2501.02086) · [Local Paper](docs/Instruction-Following%20Pruning%20for%20Large%20Language%20Models.pdf) · [Gemma 4 12B](https://huggingface.co/google/gemma-4-12B-it) · [Qwen3.5 0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 
-Unlike traditional static pruning or low-rank adaptations, IFPruning dynamically determines which feed-forward network (FFN) channels are essential for a specific input prompt, achieving high sparsity while preserving complex reasoning capabilities. The repository provides native support for DeepSpeed ZeRO optimization, distributed multi-GPU training, and multi-source data blending.
+## Overview
 
-## 2. Core Methodology
+IFPruning learns an input-dependent structured pruning policy for large language models. A lightweight predictor reads the user instruction and produces channel-level importance scores for every feed-forward network (FFN) layer. These scores are converted into fixed-budget masks and reused throughout generation.
 
-IFPruning learns to dynamically sparsify FFN activations conditioned on the user's instruction.
+This repository provides a text-only implementation built around:
 
-### 2.1 Contextual Routing
+- [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) as the masked language model;
+- [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) as the prompt-conditioned sparsity predictor;
+- [yahma/alpaca-cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned) and [teknium/OpenHermes-2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5) as the default SFT data sources;
+- DeepSpeed ZeRO-3 for distributed training and checkpoint recovery.
 
-A lightweight predictor backbone (e.g., `Qwen3.5-0.8B`) extracts hidden states from the input prompt. A trainable MLP projection head converts these states into continuous, channel-wise importance scores:
+> [!IMPORTANT]
+> The paper trains IFPruning in two stages: continued pre-training followed by SFT. This repository currently implements **SFT only**. It also uses substantially less data and compute than the paper, so its results must not be presented as a reproduction of the paper's reported benchmark scores.
 
-* $S \in \mathbb{R}^{L \times D_{ffn}}$
-* $L$: Number of Transformer layers
-* $D_{ffn}$: FFN intermediate dimension
+## Method
 
-### 2.2 Differentiable Thresholding
+### Prompt-conditioned routing
 
-A strict sparsity budget $k$ is enforced by converting the importance scores into a binary mask ($M \in \{0, 1\}^{D_{ffn}}$). The threshold $\tau$ is solved via iterative binary search. The mask remains differentiable through the backward pass using a Straight-Through Estimator (STE):
+For a user instruction, the predictor extracts the final-token representation and maps it to layer-wise FFN scores:
 
-$$M_{forward} = \text{TopK}(S, k)$$
+$$
+S = g_{\phi}(x), \qquad S \in \mathbb{R}^{L \times D_{\mathrm{ffn}}},
+$$
 
-$$M_{backward} = \sigma\left(\frac{S - \tau}{T}\right)$$
+where $L$ is the number of transformer layers and $D_{\mathrm{ffn}}$ is the original FFN intermediate dimension.
 
-### 2.3 Dynamic FFN Injection
+The current prediction head is:
 
-The original FFN computation is intercepted and masked at the activation level. A warmup scalar $\alpha \in [0, 1]$ smoothly transitions the network from a dense state to a sparse state, stabilizing early training dynamics:
+```text
+prompt → Qwen3.5-0.8B → LayerNorm → Linear(d, 128)
+       → LeakyReLU → Linear(128, L × Dffn) → routing scores
+```
 
-$$H_{sparse} = \left((1-\alpha) \cdot H_{dense} + \alpha \cdot (M \odot H_{dense})\right) W_{down}$$
+The predictor backbone, prediction head and masked LLM are optimized jointly.
 
-$$H_{dense} = \text{Act}(X W_{gate}) \odot (X W_{up})$$
+### Differentiable fixed-budget masking
 
-## 3. Training Architecture & Logic
+During training, the implementation follows the paper's soft masking form:
 
-* **Concurrent Optimization:** The base LLM (acting on responses) and the Predictor's MLP head (acting on prompts) are optimized concurrently. The Predictor's heavy backbone remains frozen.
-* **Data Curriculum Blending:** To prevent capability degradation during structural compression, the pipeline blends standard conversational datasets (Alpaca) with high-density logical/mathematical reasoning datasets (OpenHermes).
-* **Decoupled ZeRO Checkpointing:** Engineered to prevent DeepSpeed state corruption. The LLM parameters and the Predictor states are partitioned and serialized independently (`predictor_mlp.safetensors` v.s. standard HF weights), ensuring deterministic resumption.
+$$
+\lambda = \operatorname{SoftTopK}(S, k), \qquad
+m = \lambda \odot \operatorname{Top}(\lambda, k).
+$$
 
-## 4. Environment Setup
+The threshold used by `SoftTopK` is solved by binary search while preserving its implicit gradient. During validation and inference, the mask becomes an exact binary Top-K mask with exactly $k$ active FFN channels per layer.
 
-It is highly recommended to use a clean Conda environment. Ensure your CUDA version matches the PyTorch build (CUDA 12.4 is used in this example).
+### Dynamic FFN injection
+
+For a gated FFN,
+
+$$
+H = \operatorname{Act}(XW_{\mathrm{gate}}) \odot XW_{\mathrm{up}},
+$$
+
+the selected mask is applied before the down projection:
+
+$$
+Y = \left[(1-\alpha)H + \alpha(H \odot m)\right]W_{\mathrm{down}},
+$$
+
+where $\alpha$ gradually moves training from the dense path to the sparse path. Validation always evaluates the fully sparse, hard-mask configuration used at deployment.
+
+## Repository layout
+
+```text
+IFPruning-SFT/
+├── train.py                 # Training entry point, Trainer and checkpoint logic
+├── inference.py             # Single-prompt and interactive inference
+├── ifpruning_core.py        # Predictor, SoftTopK and dynamic FFN modules
+├── ifpruning_data.py        # Dataset normalization and SFT sequence builder
+├── inspect_model.py         # Base-model structure inspection
+├── visualize_loss.py        # Loss, learning-rate and mask-alpha plots
+├── visualize_routing.py     # Hard Top-K routing comparison
+├── docs/                    # Papers and external reference material
+│   ├── Instruction-Following Pruning for Large Language Models.pdf
+│   └── apple-foundation-models.png
+├── figs/                    # Project figures and visualizations
+├── tests/
+│   ├── unit/                # Fast, hardware-independent unit tests
+│   └── integration/         # Multi-GPU DeepSpeed checkpoint tests
+└── requirements.txt
+```
+
+## Documentation and references
+
+- [Instruction-Following Pruning for Large Language Models (local PDF)](docs/Instruction-Following%20Pruning%20for%20Large%20Language%20Models.pdf)
+- [Apple Foundation Models reference screenshot](docs/apple-foundation-models.png)
+
+## Installation
+
+### Conda environment
+
+The current workspace uses the `Vitamin-E` environment:
 
 ```bash
-# 1. Create and activate environment
-conda create -n ifpruning python=3.12 -y
-conda activate ifpruning
+conda activate Vitamin-E
+cd ~/IFPruning-SFT
+pip install -r requirements.txt
+```
 
-# 2. Install PyTorch ecosystem
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+For a clean installation:
 
-# 3. Install core dependencies
-pip install transformers datasets accelerate safetensors deepspeed
+```bash
+conda create -n Vitamin-E python=3.12 -y
+conda activate Vitamin-E
 
-# 4. Install Hugging Face Hub (for downloading assets)
+# Install a PyTorch build compatible with the host CUDA driver first.
+pip install torch
+pip install -r requirements.txt
+```
+
+PyTorch and CUDA versions must match the target machine. The default training configuration uses BF16 and is intended for recent data-center GPUs; FP16/FP32 can be selected where appropriate.
+
+## Model and dataset preparation
+
+### Official resources
+
+| Role | Hugging Face repository | Default local path |
+| --- | --- | --- |
+| Base LLM | [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) | `./gemma-4-12B` |
+| Sparsity predictor | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) | `./Qwen3.5-0.8B` |
+| Instruction data | [yahma/alpaca-cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned) | `./alpaca-cleaned` |
+| Conversation data | [teknium/OpenHermes-2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5) | `./OpenHermes-2.5` |
+
+Install the official Hugging Face CLI and authenticate if required:
+
+```bash
 pip install -U "huggingface_hub[cli]"
+hf auth login
 ```
 
-## 5. Model & Data Preparation
-
-Download the required base models, routing predictors, and datasets into the project root directory. *(Note: `HF_ENDPOINT` is provided for users requiring mirrors).*
-
-**Models:**
+Download the models:
 
 ```bash
-hf download google/gemma-4-12B --local-dir ./gemma-4-12B
-HF_ENDPOINT=https://hf-mirror.com hf download Qwen/Qwen3.5-0.8B --local-dir ./Qwen3.5-0.8B
+hf download google/gemma-4-12B-it \
+  --local-dir ./gemma-4-12B
+
+HF_ENDPOINT=https://hf-mirror.com hf download Qwen/Qwen3.5-0.8B \
+  --local-dir ./Qwen3.5-0.8B
 ```
 
-**Datasets:**
+Download the datasets:
 
 ```bash
-hf download --repo-type dataset yahma/alpaca-cleaned --local-dir ./alpaca-cleaned
-hf download --repo-type dataset teknium/OpenHermes-2.5 --local-dir ./OpenHermes-2.5
+hf download yahma/alpaca-cleaned \
+  --repo-type dataset \
+  --local-dir ./alpaca-cleaned
+
+hf download teknium/OpenHermes-2.5 \
+  --repo-type dataset \
+  --local-dir ./OpenHermes-2.5
 ```
 
-## 6. Workflow: Training & Inference
+The default training paths expect:
 
-### 6.1 Training
+```text
+./alpaca-cleaned/alpaca_data_cleaned.json
+./OpenHermes-2.5/openhermes2_5.json
+```
 
-The pipeline is configured via `@dataclass` in `train.py`. Launch the distributed training using `torchrun`. Adjust `--nproc_per_node` according to your GPU count.
+By default, all Alpaca examples and a seeded 100,000-example OpenHermes sample are used. Alternative local paths and sample counts can be provided through `train.py` arguments.
+
+## Training
+
+### Start a new run
 
 ```bash
 OMP_NUM_THREADS=1 \
 TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-torchrun --nproc_per_node=2 train.py
+torchrun --nproc_per_node=2 train.py \
+  --output_dir ./gemma-12B-ifpruning-output \
+  --zero_stage 3 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4
 ```
 
-![loss curve](loss_curve.png)
+With two GPUs, this launch configuration produces a global batch size of 32:
 
-### 6.2 Inference
+```text
+4 samples/GPU × 2 GPUs × 4 gradient-accumulation steps = 32
+```
 
-Use `inference_IFP.py` to deploy the pruned model in an interactive terminal shell. The predictor dynamically injects sparsity masks based on the semantics of each prompt you type. Ensure the paths in `inference_IFP.py` (`BASE_MODEL_PATH`, `PREDICTOR_MODEL_PATH`, `CHECKPOINT_DIR`) correctly point to your local directories, then launch the interactive shell:
+ZeRO-3 partitions model parameters, gradients and optimizer states. Optimizer subgroups are capped at 500 million parameters to avoid oversized temporary buffers.
+
+The training entry point refuses to start a fresh run in a non-empty output directory. This prevents accidental checkpoint mixing. Use `--overwrite_output_dir` only when intentional.
+
+### Resume a run
+
+Resume from the newest checkpoint:
 
 ```bash
-python inference_IFP.py
+torchrun --nproc_per_node=2 train.py \
+  --output_dir ./gemma-12B-ifpruning-output \
+  --zero_stage 3 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
+  --resume auto
 ```
 
-### 6.3 Checkpoint and Restore
-
-Run checkpoint validation before a full training run to verify state integrity.
-
-**Phase 1: State checkpoint**
-```bash
-TEST_PHASE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=2 test_ckpt.py
-```
-
-**Phase 2: Checkpoint restore**
-```bash
-TEST_PHASE=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=2 test_ckpt.py
-```
-
-Expected result: successful restoration of optimizer slices and loss trajectory without deadlocks or I/O corruption.
-
-## 7. Troubleshooting
-
-### PyTorch & CUDA version alignment
-
-Ensure PyTorch and CUDA versions match the deployed system and the installed binary. Incorrect CUDA builds can trigger NCCL failures such as `ncclCommResume`.
-
-Example installation for CUDA 12.4:
+Or provide an explicit checkpoint:
 
 ```bash
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torchrun --nproc_per_node=2 train.py \
+  --output_dir ./gemma-12B-ifpruning-output \
+  --zero_stage 3 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
+  --resume ./gemma-12B-ifpruning-output/checkpoint-500
 ```
 
-### Notes
+Resume validates the current checkpoint manifest strictly: layer count, FFN dimensions, predictor architecture, SoftTopK settings, ZeRO stage and chat-template configuration must match the checkpoint manifest.
 
-* `plot_loss.py` visualizes training dynamics using the default log path `./gemma-12b-ifpruning-output/logs/training_rank_0.log`.
-* Keep the root directory structure intact to ensure the strict offline data parsers can locate the JSON files and build the Arrow cache properly.
+### Important defaults
+
+| Argument | Default | Description |
+| --- | ---: | --- |
+| `--target_intermediate_dim` | `4096` | Active FFN channels per layer |
+| `--max_seq_length` | `2048` | Maximum LLM training length |
+| `--max_response_length` | `512` | Maximum supervised response length |
+| `--max_predictor_length` | `1024` | Maximum predictor input length |
+| `--per_device_train_batch_size` | `4` | Training micro-batch size per GPU |
+| `--per_device_eval_batch_size` | `2` | Validation micro-batch size per GPU |
+| `--gradient_accumulation_steps` | `4` | Gradient accumulation steps |
+| `--warmup_steps` | `0.03` | Optimizer warmup ratio under the Transformers 5 API |
+| `--zero_stage` | `3` | DeepSpeed ZeRO stage; ZeRO-3 shards parameters, gradients and optimizer states |
+| `--base_lr` | `2e-6` | Masked LLM learning rate |
+| `--predictor_lr` | `1e-5` | Predictor learning rate |
+| `--mask_warmup_steps` | `2000` | Dense-to-sparse transition |
+| `--validation_samples` | `512` | Fixed validation examples |
+| `--eval_steps` | `500` | Hard-mask evaluation interval |
+| `--save_steps` | `500` | Checkpoint interval |
+| `--save_total_limit` | `1` | Keep only the latest training checkpoint |
+
+Run `python train.py --help` for the complete configuration. The documented training path uses DeepSpeed ZeRO-3 for full fine-tuning of the 12B base model.
+
+## Inference
+
+### Single prompt
+
+```bash
+python inference.py \
+  --checkpoint ./gemma-12B-ifpruning-output \
+  --prompt "Write a Python function that checks whether a number is prime."
+```
+
+### Interactive mode
+
+Omit `--prompt`:
+
+```bash
+python inference.py \
+  --checkpoint ./gemma-12B-ifpruning-output
+```
+
+The checkpoint must contain the current manifest, base tokenizer, predictor tokenizer and the predictor payload produced by `train.py`. Use `--predictor-model` only when the path recorded in the manifest is unavailable on the inference machine.
+
+Useful options:
+
+- `--do-sample`: enable sampling instead of greedy decoding
+- `--temperature 0.7 --top-p 0.9`: configure sampling
+- `--dtype auto|bfloat16|float16|float32`: select inference precision
+- `--dense`: disable masks for a dense-path comparison
+- `--score-dir ./routing_scores`: choose where routing scores are saved
+
+Generation stops on either the tokenizer EOS token or Gemma's `<turn|>` token. Interactive inference also reports Top-K overlap between adjacent prompts and warns when all layer masks are identical.
+
+## Checkpoints
+
+A final export contains:
+
+```text
+model*.safetensors             # Masked LLM weights
+predictor.safetensors          # Full predictor
+ifpruning_config.json          # Architecture and routing manifest
+predictor_tokenizer/           # Predictor tokenizer
+trainer_state.json             # Trainer state and metric history
+```
+
+Training logs persist `mask_alpha`, `routing_input_std` and `routing_head_active_fraction`. Non-finite loss, repeated near-zero loss or persistent input-independent routing raises an error and prevents the failed run from being exported as a successful final model.
+
+## Validation and tests
+
+Run the lightweight regression suite:
+
+```bash
+python -m unittest discover -s tests/unit -t . -v
+python -m py_compile \
+  train.py inference.py ifpruning_core.py ifpruning_data.py \
+  inspect_model.py visualize_loss.py visualize_routing.py
+```
+
+Run the two-phase DeepSpeed checkpoint test:
+
+```bash
+TEST_PHASE=1 torchrun --nproc_per_node=2 tests/integration/test_checkpoint.py
+TEST_PHASE=2 torchrun --nproc_per_node=2 tests/integration/test_checkpoint.py
+```
+
+Before a long run, evaluate a fixed set of instruction-following, mathematics and coding prompts with:
+
+1. the original dense base model;
+2. the current checkpoint's dense path (`inference.py --dense`);
+3. the current checkpoint's hard-sparse path.
+
+Training loss alone is not sufficient evidence that prompt-conditioned routing is working.
+
+## Visualization
+
+Plot training loss, learning rate and mask alpha:
+
+```bash
+python visualize_loss.py \
+  --log ./gemma-12B-ifpruning-output/logs/rank_0.log \
+  --output ./figs/loss_curve.png
+```
+
+![Training loss curve](figs/loss_curve.png)
+
+Compare the hard Top-K masks for two saved prompts:
+
+```bash
+python visualize_routing.py \
+  routing_scores/score_01.pt \
+  routing_scores/score_02.pt \
+  --target-dim 4096
+```
+
+![Prompt-conditioned routing comparison](figs/routing_comparison.png)
+
+## Parameter-count and performance notes
+
+The local Gemma 4 12B configuration has 48 transformer layers and an FFN intermediate dimension of 15,360. Selecting 4,096 channels retains 26.67% of each FFN. After accounting for attention, embeddings and other non-FFN parameters, the theoretical active base-model size is approximately **5.73B parameters**.
+
+The current PyTorch implementation computes the full `gate_proj` and `up_proj` matrix multiplications before masking their activations. It is suitable for algorithm development and quality evaluation, but it does **not** provide real inference acceleration. Production speedups require gathering and caching physically reduced FFN weight matrices for the selected mask.
+
+## Limitations and roadmap
+
+- [ ] Implement the continued pre-training stage from the paper
+- [ ] Expand and clean the instruction data mixture
+- [ ] Add IFEval, HumanEval/MBPP, GSM8K/MATH and other fixed benchmarks
+- [ ] Select best checkpoints using task-level evaluation
+- [ ] Implement physical FFN weight gathering and caching
+- [ ] Publish a complete training and evaluation report
+
+## Citation
+
+If you use this repository, please cite the original IFPruning paper:
+
+```bibtex
+@article{hou2025instructionfollowing,
+  title   = {Instruction-Following Pruning for Large Language Models},
+  author  = {Hou, Bairu and Chen, Qibin and Wang, Jianyu and Yin, Guoli and
+             Wang, Chong and Du, Nan and Pang, Ruoming and Chang, Shiyu and Lei, Tao},
+  journal = {arXiv preprint arXiv:2501.02086},
+  year    = {2025}
+}
+```
+
+## Acknowledgements
+
+- [Instruction-Following Pruning for Large Language Models](https://arxiv.org/abs/2501.02086)
+- [Google Gemma 4](https://huggingface.co/google/gemma-4-12B-it)
+- [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+- [Alpaca Cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned)
+- [OpenHermes 2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5)
+
+This repository is an independent implementation and is not affiliated with the paper authors, Google or Qwen.

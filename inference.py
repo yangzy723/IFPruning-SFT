@@ -1,255 +1,369 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-IFPruning SFT Inference Pipeline (Layer-wise Routing Aligned)
-Supports interactive terminal chat and exports routing scores for visualization.
-"""
+"""Validated IFPruning inference with shared train/inference components."""
 
-import os
-import sys
+import argparse
+import json
 import logging
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import math
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from transformers.models.gemma.modeling_gemma import GemmaMLP
 from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ==============================================================================
-# Global Configuration
-# ==============================================================================
-BASE_MODEL_PATH = "./gemma-4-12B"
-PREDICTOR_MODEL_PATH = "./Qwen3.5-0.8B"
-CHECKPOINT_DIR = "./gemma-12B-ifpruning-output" 
-TARGET_SPARSE_DIM = 4096
+from ifpruning_core import DynamicMaskedFFN, SparsityPredictor, find_transformer_layers
+from ifpruning_data import CHAT_TEMPLATE_FORMAT, ensure_bos
 
-# 用于保存 Score
-SCORE_DUMP_DIR = Path("./routing_scores")
-SCORE_DUMP_DIR.mkdir(exist_ok=True, parents=True)
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] [%(process)d] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S", 
-    level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("ifpruning_inference")
+LOGGER = logging.getLogger("ifpruning_inference")
 
-# ==============================================================================
-# Module 1 & 2: Architecture & Wrapper
-# ==============================================================================
-class SparsityPredictor(nn.Module):
-    def __init__(self, num_layers: int, ffn_dim: int, extractor_path: str):
-        super().__init__()
-        self.num_layers = num_layers
-        self.ffn_dim = ffn_dim
-        
-        self.feature_extractor = AutoModel.from_pretrained(
-            extractor_path, torch_dtype=torch.bfloat16, local_files_only=True
-        )
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-            
-        config = self.feature_extractor.config
-        extractor_hidden_dim = getattr(config, "hidden_size", None) or \
-                               getattr(config, "d_model", None) or \
-                               getattr(config, "n_embd", None)    
-        
-        if extractor_hidden_dim is None:
-            extractor_hidden_dim = self.feature_extractor.get_input_embeddings().weight.shape[1]
 
-        # 对齐训练端的 2 层 MLP 架构
-        self.mlp = nn.Sequential(
-            nn.Linear(extractor_hidden_dim, 384),
-            nn.GELU(),
-            nn.Linear(384, self.num_layers * self.ffn_dim)
-        )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default="./gemma-12B-ifpruning-output")
+    parser.add_argument(
+        "--predictor-model",
+        default=None,
+        help="Override the predictor path stored in the checkpoint manifest",
+    )
+    parser.add_argument(
+        "--prompt", default=None, help="Run one prompt instead of the interactive shell"
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-predictor-length", type=int, default=1024)
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="bfloat16",
+    )
+    parser.add_argument("--score-dir", default="./routing_scores")
+    parser.add_argument(
+        "--dense", action="store_true", help="Disable masks for a dense checkpoint baseline"
+    )
+    return parser.parse_args()
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        outputs = self.feature_extractor(input_ids=input_ids, attention_mask=attention_mask)
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        last_token_states = outputs.last_hidden_state[torch.arange(input_ids.shape[0]), seq_lengths]
-        return self.mlp(last_token_states).view(-1, self.num_layers, self.ffn_dim)
 
-class GemmaDynamicMaskedFFN_Inference(nn.Module):
-    def __init__(self, original_mlp: GemmaMLP, target_ffn_dim: int):
-        super().__init__()
-        self.gate_proj = original_mlp.gate_proj
-        self.up_proj = original_mlp.up_proj
-        self.down_proj = original_mlp.down_proj
-        self.act_fn = original_mlp.act_fn 
-        self.target_ffn_dim = target_ffn_dim
-        self.full_ffn_dim = int(getattr(self.gate_proj, "out_features"))
-        self.layer_scores = None 
+def read_manifest(checkpoint: Path) -> dict:
+    path = checkpoint / "ifpruning_config.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing IFPruning manifest: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        manifest = json.load(file)
+    required_fields = (
+        "chat_template_format",
+        "num_layers",
+        "full_intermediate_dim",
+        "target_intermediate_dim",
+        "predictor_model",
+        "predictor_hidden_dim",
+        "mask_temperature",
+        "softtopk_iters",
+    )
+    missing = [field for field in required_fields if field not in manifest]
+    if missing:
+        raise ValueError(f"Checkpoint manifest is incomplete: missing {missing} in {path}")
+    if manifest["chat_template_format"] != CHAT_TEMPLATE_FORMAT:
+        raise ValueError("Checkpoint uses an unsupported chat-template format")
+    return manifest
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_out = self.act_fn(self.gate_proj(x))
-        up_out = self.up_proj(x)
-        
-        if self.layer_scores is not None:
-            scores = self.layer_scores.to(device=x.device, dtype=x.dtype)
-            _, topk_idx = torch.topk(scores, self.target_ffn_dim, dim=-1)
-            indicator = torch.zeros_like(scores).scatter_(-1, topk_idx, 1.0)
-            mask = indicator.unsqueeze(1) 
-            scale_factor = math.sqrt(max(1.0, self.full_ffn_dim / max(1, self.target_ffn_dim)))
-            activated_hidden = (gate_out * up_out) * mask * scale_factor
-        else:
-            activated_hidden = gate_out * up_out
-            
-        return self.down_proj(activated_hidden)
 
-class GemmaIFPruningWrapper(nn.Module):
-    def __init__(self, base_model, target_ffn_dim: int, extractor_path: str):
+def predictor_payload(checkpoint: Path) -> Path:
+    filename = "predictor.safetensors"
+    path = checkpoint / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Missing predictor state: {path}")
+    return path
+
+
+def resolve_predictor_config(manifest: dict) -> dict:
+    """Load predictor settings from the current checkpoint manifest."""
+    return {
+        "hidden_dim": int(manifest["predictor_hidden_dim"]),
+        "mask_temperature": float(manifest["mask_temperature"]),
+        "softtopk_iters": int(manifest["softtopk_iters"]),
+    }
+
+
+class IFPruningInferenceModel(nn.Module):
+    def __init__(
+        self,
+        base_model: nn.Module,
+        predictor_path: str,
+        target_dim: int,
+        predictor_config: dict,
+    ):
         super().__init__()
         self.base_model = base_model
-        cfg = getattr(base_model.config, "text_config", base_model.config)
-        
+        text_config = base_model.config.text_config
+        self.num_layers = int(text_config.num_hidden_layers)
+        self.ffn_dim = int(text_config.intermediate_size)
+        if not 0 < target_dim <= self.ffn_dim:
+            raise ValueError(f"Invalid target dimension {target_dim} for FFN size {self.ffn_dim}")
+
         self.predictor = SparsityPredictor(
-            cfg.num_hidden_layers, cfg.intermediate_size, extractor_path
+            num_layers=self.num_layers,
+            ffn_dim=self.ffn_dim,
+            extractor_path=predictor_path,
+            local_files_only=True,
+            hidden_dim=predictor_config["hidden_dim"],
+            extractor_dtype=next(base_model.parameters()).dtype,
         )
-        
-        target_device = next(base_model.parameters()).device
-        self.predictor.to(device=target_device, dtype=base_model.dtype)
-        
-        self.llm_layers = [m for n, m in self.base_model.named_modules() if isinstance(m, nn.ModuleList) and hasattr(m[0], 'mlp')][0]
-        for layer in self.llm_layers:
-            layer.mlp = GemmaDynamicMaskedFFN_Inference(layer.mlp, target_ffn_dim)
 
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base_model, name)
+        self.layers = find_transformer_layers(base_model)
+        if len(self.layers) != self.num_layers:
+            raise ValueError(
+                f"Config declares {self.num_layers} layers, found {len(self.layers)} MLP blocks"
+            )
+        for layer in self.layers:
+            layer.mlp = DynamicMaskedFFN(
+                layer.mlp,
+                target_dim=target_dim,
+                mask_temperature=predictor_config["mask_temperature"],
+                softtopk_iters=predictor_config["softtopk_iters"],
+            )
+            layer.mlp.mask_alpha.fill_(1.0)
 
-    def compute_and_lock_mask(self, predictor_input_ids: torch.Tensor, predictor_attention_mask: torch.Tensor):
-        with torch.no_grad():
-            target_device = next(self.predictor.parameters()).device
-            p_ids = predictor_input_ids.to(target_device)
-            p_mask = predictor_attention_mask.to(target_device)
-            
-            all_layer_scores = self.predictor(p_ids, p_mask)
-            
-            for i, layer in enumerate(self.llm_layers):
-                layer.mlp.layer_scores = all_layer_scores[:, i, :]
-            
-            return all_layer_scores.cpu()
+        predictor_device = next(base_model.parameters()).device
+        self.predictor.to(device=predictor_device)
 
-# ==============================================================================
-# Execution Entry Point
-# ==============================================================================
-def main():
-    checkpoint_dir = Path(CHECKPOINT_DIR)
-    predictor_model_path = Path(PREDICTOR_MODEL_PATH)
-    base_model_path = Path(BASE_MODEL_PATH)
-    predictor_weights_path = checkpoint_dir / "predictor_mlp.safetensors"
-    
-    if not checkpoint_dir.exists() or not predictor_weights_path.exists():
-        raise FileNotFoundError(f"Missing checkpoint or predictor weights in {checkpoint_dir}")
+    @torch.inference_mode()
+    def compute_and_lock_mask(
+        self,
+        predictor_input_ids: torch.Tensor,
+        predictor_attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        predictor_device = next(self.predictor.parameters()).device
+        scores = self.predictor(
+            predictor_input_ids.to(predictor_device),
+            predictor_attention_mask.to(predictor_device),
+        )
+        for index, layer in enumerate(self.layers):
+            layer_device = layer.mlp.gate_proj.weight.device
+            layer.mlp.layer_scores = scores[:, index, :].to(layer_device)
+        return scores.float().cpu()
 
-    logger.info("Initializing tokenizers...")
-    base_tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), local_files_only=True)
-    predictor_tokenizer = AutoTokenizer.from_pretrained(str(predictor_model_path), local_files_only=True)
 
-    logger.info("Loading custom base model from checkpoint...")
+def load_model(args: argparse.Namespace):
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint}")
+
+    manifest = read_manifest(checkpoint)
+    payload_path = predictor_payload(checkpoint)
+    predictor_state = load_file(str(payload_path))
+    predictor_config = resolve_predictor_config(manifest)
+
+    predictor_source = args.predictor_model or manifest["predictor_model"]
+
+    base_tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), local_files_only=True)
+    if not base_tokenizer.chat_template:
+        raise ValueError("Checkpoint tokenizer is missing its chat template")
+    if base_tokenizer.pad_token_id is None or base_tokenizer.eos_token_id is None:
+        raise ValueError("Checkpoint tokenizer must define PAD and EOS tokens")
+
+    predictor_tokenizer_path = checkpoint / "predictor_tokenizer"
+    if not predictor_tokenizer_path.is_dir():
+        raise FileNotFoundError(f"Missing predictor tokenizer: {predictor_tokenizer_path}")
+    predictor_tokenizer = AutoTokenizer.from_pretrained(
+        str(predictor_tokenizer_path), local_files_only=True
+    )
+    dtype = (
+        "auto"
+        if args.dtype == "auto"
+        else {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }[args.dtype]
+    )
     base_model = AutoModelForCausalLM.from_pretrained(
-        str(checkpoint_dir), 
-        torch_dtype=torch.bfloat16, 
+        str(checkpoint),
+        dtype=dtype,
         device_map="auto",
-        local_files_only=True
+        local_files_only=True,
     )
 
-    try:
-        embed_weight = base_model.model.language_model.embed_tokens.weight
-        lm_head_weight = base_model.lm_head.weight
-        if embed_weight.data_ptr() != lm_head_weight.data_ptr():
-            base_model.lm_head.weight = embed_weight
-    except Exception:
-        pass
-
-    logger.info("Injecting dynamic activation sparsity architecture...")
-    model = GemmaIFPruningWrapper(
-        base_model, TARGET_SPARSE_DIM, str(predictor_model_path)
+    model = IFPruningInferenceModel(
+        base_model=base_model,
+        predictor_path=str(predictor_source),
+        target_dim=int(manifest["target_intermediate_dim"]),
+        predictor_config=predictor_config,
     )
+    if int(manifest["num_layers"]) != model.num_layers:
+        raise ValueError("Checkpoint manifest layer count does not match the base model")
+    if int(manifest["full_intermediate_dim"]) != model.ffn_dim:
+        raise ValueError("Checkpoint manifest FFN dimension does not match the base model")
 
-    logger.info("Restoring decoupled predictor parameters from safetensors...")
-    pred_state_dict = load_file(str(predictor_weights_path))
-    model.predictor.mlp.load_state_dict(pred_state_dict, strict=True)
-    del pred_state_dict
-    
+    model.predictor.load_state_dict(predictor_state, strict=True)
     model.eval()
-    print("\n" + "=" * 60)
-    print("--- IFPruning Interactive Shell ---")
-    print("Type 'quit' or 'exit' to stop.")
-    print("=" * 60 + "\n")
-    
-    chat_tpl = (
-        "{% for m in messages %}"
-        "{{'<|turn>' + m['role'] + '\\n' + m['content'] + '<turn|>\\n'}}"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}{{'<|turn>model\\n'}}{% endif %}"
-    )
-    
-    input_device = next(base_model.parameters()).device
-    prompt_idx = 1
+    return model, base_tokenizer, predictor_tokenizer, manifest
 
+
+def tokenize_base_prompt(
+    tokenizer, instruction: str, device: torch.device
+) -> dict[str, torch.Tensor]:
+    messages = [{"role": "user", "content": instruction}]
+    chat_template = tokenizer.chat_template
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        chat_template=chat_template,
+    )
+    encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+    ids = ensure_bos(encoded["input_ids"][0].tolist(), tokenizer.bos_token_id)
+    encoded["input_ids"] = torch.tensor([ids], dtype=torch.long)
+    encoded["attention_mask"] = torch.ones_like(encoded["input_ids"])
+    return {key: value.to(device) for key, value in encoded.items()}
+
+
+def stopping_ids(tokenizer) -> list[int]:
+    if "<turn|>" not in tokenizer.get_vocab():
+        raise ValueError("Checkpoint tokenizer is missing the <turn|> token")
+    return [
+        int(tokenizer.eos_token_id),
+        int(tokenizer.convert_tokens_to_ids("<turn|>")),
+    ]
+
+
+def safe_score_name(index: int, prompt: str) -> str:
+    stem = "".join(
+        character
+        for character in prompt[:30]
+        if character.isalnum() or character.isspace()
+    )
+    stem = stem.strip().replace(" ", "_") or "prompt"
+    return f"score_{index:02d}_{stem}.pt"
+
+
+def run_prompt(
+    model: IFPruningInferenceModel,
+    base_tokenizer,
+    predictor_tokenizer,
+    instruction: str,
+    args: argparse.Namespace,
+    prompt_index: int,
+    previous_scores: torch.Tensor | None,
+) -> torch.Tensor:
+    input_device = next(model.base_model.parameters()).device
+    base_inputs = tokenize_base_prompt(base_tokenizer, instruction, input_device)
+    predictor_inputs = predictor_tokenizer(
+        instruction,
+        return_tensors="pt",
+        add_special_tokens=True,
+        truncation=True,
+        max_length=args.max_predictor_length,
+    )
+
+    if args.dense:
+        scores = torch.empty(0)
+    else:
+        scores = model.compute_and_lock_mask(
+            predictor_inputs["input_ids"],
+            predictor_inputs["attention_mask"],
+        )
+        score_path = Path(args.score_dir) / safe_score_name(prompt_index, instruction)
+        torch.save({"prompt": instruction, "scores": scores.squeeze(0)}, score_path)
+        LOGGER.info("Routing scores saved to %s", score_path)
+
+        if previous_scores is not None and previous_scores.shape == scores.shape:
+            target_dim = model.layers[0].mlp.target_ffn_dim
+            previous_top = torch.topk(previous_scores, target_dim, dim=-1).indices
+            current_top = torch.topk(scores, target_dim, dim=-1).indices
+            previous_mask = torch.zeros_like(previous_scores, dtype=torch.bool).scatter_(
+                -1, previous_top, True
+            )
+            current_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+                -1, current_top, True
+            )
+            overlap = (previous_mask & current_mask).sum(dim=-1).float() / target_dim
+            LOGGER.info(
+                "Cross-prompt TopK overlap: mean=%.4f max=%.4f",
+                overlap.mean(),
+                overlap.max(),
+            )
+            if torch.all(overlap > 0.999):
+                LOGGER.warning(
+                    "All layer masks are identical across different prompts; routing is static"
+                )
+
+    stop_tokens = stopping_ids(base_tokenizer)
+    generation_kwargs = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": args.do_sample,
+        "pad_token_id": base_tokenizer.pad_token_id,
+        "eos_token_id": stop_tokens,
+    }
+    if args.do_sample:
+        generation_kwargs.update(temperature=args.temperature, top_p=args.top_p)
+    with torch.inference_mode():
+        output = model.base_model.generate(**base_inputs, **generation_kwargs)
+    input_length = base_inputs["input_ids"].shape[1]
+    response_ids = output[0, input_length:]
+    final_token_id = int(response_ids[-1]) if response_ids.numel() else None
+    LOGGER.info(
+        "Generated %d tokens; final_token_id=%s; stopped_on_boundary=%s",
+        response_ids.numel(),
+        final_token_id,
+        final_token_id in stop_tokens if final_token_id is not None else False,
+    )
+    response = base_tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+    print(f"[IFP Model] {response}")
+    return scores
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    Path(args.score_dir).mkdir(parents=True, exist_ok=True)
+
+    model, base_tokenizer, predictor_tokenizer, manifest = load_model(args)
+    LOGGER.info(
+        "Loaded target=%s/%s channels (%.2f%% retained)",
+        manifest["target_intermediate_dim"],
+        model.ffn_dim,
+        100.0 * int(manifest["target_intermediate_dim"]) / model.ffn_dim,
+    )
+
+    if args.prompt is not None:
+        run_prompt(model, base_tokenizer, predictor_tokenizer, args.prompt, args, 1, None)
+        return
+
+    print("IFPruning interactive shell. Type 'quit' or 'exit' to stop.")
+    previous_scores = None
+    prompt_index = 1
     while True:
         try:
-            instruction = input(f"\n[User (Prompt #{prompt_idx})] ❯ ")
-            if not instruction.strip():
-                continue
-            if instruction.strip().lower() in ['quit', 'exit']:
-                print("Exiting...")
-                break
-                
-            messages = [{"role": "user", "content": instruction}]
-            base_prompt = base_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, chat_template=chat_tpl)
-            base_inputs = base_tokenizer(base_prompt, return_tensors="pt", add_special_tokens=False)
-            base_inputs = {k: v.to(input_device) for k, v in base_inputs.items()}
-            
-            pred_inputs = predictor_tokenizer(instruction, return_tensors="pt", add_special_tokens=True)
-            
-            # 计算掩码，并提取 Score 矩阵
-            scores_tensor = model.compute_and_lock_mask(
-                predictor_input_ids=pred_inputs["input_ids"],
-                predictor_attention_mask=pred_inputs["attention_mask"]
-            )
-
-            safe_name = "".join(x for x in instruction[:15] if x.isalnum() or x.isspace()).replace(" ", "_")
-            file_name = f"score_{prompt_idx:02d}_{safe_name}.pt"
-            save_path = SCORE_DUMP_DIR / file_name
-            
-            torch.save({
-                "prompt": instruction,
-                "scores": scores_tensor.squeeze(0).float() # 完整的 [真实层数, D] 矩阵
-            }, save_path)
-            
-            print(f"[*] Routing scores saved to: ./routing_scores/{file_name}")
-
-            print("[IFP Model] ❯ ", end="", flush=True)
-            with torch.no_grad():
-                outputs = model.base_model.generate(
-                    **base_inputs, 
-                    max_new_tokens=512,
-                    temperature=0.7,
-                    top_p=0.9,
-                    repetition_penalty=1.05,
-                    do_sample=True,
-                    pad_token_id=base_tokenizer.eos_token_id
-                )
-            
-            input_length = base_inputs["input_ids"].shape[1]
-            response = base_tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
-            print(response)
-            
-            prompt_idx += 1
-
-        except KeyboardInterrupt:
-            print("\nExiting...")
+            instruction = input("\n[User] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
-        except Exception as e:
-            logger.error(f"Generation error: {e}")
+        if not instruction:
+            continue
+        if instruction.lower() in {"quit", "exit"}:
+            break
+        previous_scores = run_prompt(
+            model,
+            base_tokenizer,
+            predictor_tokenizer,
+            instruction,
+            args,
+            prompt_index,
+            previous_scores,
+        )
+        prompt_index += 1
+
 
 if __name__ == "__main__":
     main()
