@@ -79,6 +79,26 @@ def predictor_payload(checkpoint: Path) -> Path:
     return path
 
 
+def predictor_tokenizer_source(checkpoint: Path, predictor_source: str) -> str:
+    embedded = checkpoint / "predictor_tokenizer"
+    if embedded.is_dir():
+        return str(embedded)
+
+    source = Path(predictor_source)
+    if source.is_dir():
+        LOGGER.warning(
+            "Checkpoint has no embedded predictor tokenizer; loading it from %s",
+            source,
+        )
+        return str(source)
+
+    raise FileNotFoundError(
+        f"Missing predictor tokenizer in {embedded} and predictor source is not a "
+        f"local directory: {predictor_source}. Pass --predictor-model with the "
+        "training predictor directory."
+    )
+
+
 def resolve_predictor_config(manifest: dict) -> dict:
     """Load predictor settings from the current checkpoint manifest."""
     return {
@@ -165,11 +185,9 @@ def load_model(args: argparse.Namespace):
     if base_tokenizer.pad_token_id is None or base_tokenizer.eos_token_id is None:
         raise ValueError("Checkpoint tokenizer must define PAD and EOS tokens")
 
-    predictor_tokenizer_path = checkpoint / "predictor_tokenizer"
-    if not predictor_tokenizer_path.is_dir():
-        raise FileNotFoundError(f"Missing predictor tokenizer: {predictor_tokenizer_path}")
+    predictor_tokenizer_path = predictor_tokenizer_source(checkpoint, predictor_source)
     predictor_tokenizer = AutoTokenizer.from_pretrained(
-        str(predictor_tokenizer_path), local_files_only=True
+        predictor_tokenizer_path, local_files_only=True
     )
     dtype = (
         "auto"

@@ -52,6 +52,19 @@ class RankFilter(logging.Filter):
         return True
 
 
+class PredictorTokenizerCheckpointCallback(TrainerCallback):
+    """Save the predictor tokenizer alongside every Trainer checkpoint."""
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self.tokenizer = tokenizer
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            self.tokenizer.save_pretrained(str(checkpoint_dir / "predictor_tokenizer"))
+        return control
+
+
 def setup_logging(output_dir: str, log_level: str = "INFO") -> tuple[logging.Logger, Path]:
     log_dir = Path(output_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -832,7 +845,8 @@ def main():
                 cfg.abort_on_zero_loss_steps,
                 cfg.abort_on_routing_collapse_logs,
                 cfg.min_routing_input_std,
-            )
+            ),
+            PredictorTokenizerCheckpointCallback(predictor_tokenizer),
         ],
         predictor_lr=cfg.predictor_lr,
         base_lr=cfg.base_lr,

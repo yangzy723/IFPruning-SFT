@@ -1,11 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
-from train import IFPruningTrainer
+from train import IFPruningTrainer, PredictorTokenizerCheckpointCallback
 
 
 class MixedDtypeModel(nn.Module):
@@ -28,6 +30,21 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertLess(config.per_device_eval_batch_size, config.per_device_train_batch_size)
         self.assertEqual(config.save_steps, 500)
         self.assertEqual(config.save_total_limit, 1)
+
+    def test_predictor_tokenizer_is_saved_in_checkpoint(self):
+        tokenizer = SimpleNamespace(
+            save_pretrained=lambda path: Path(path).mkdir(parents=True)
+        )
+        callback = PredictorTokenizerCheckpointCallback(tokenizer)
+        with tempfile.TemporaryDirectory() as output_dir:
+            callback.on_save(
+                SimpleNamespace(output_dir=output_dir),
+                SimpleNamespace(global_step=500, is_world_process_zero=True),
+                SimpleNamespace(),
+            )
+            self.assertTrue(
+                (Path(output_dir) / "checkpoint-500" / "predictor_tokenizer").is_dir()
+            )
 
 
 class ZeRO3OptimizerGroupingTests(unittest.TestCase):

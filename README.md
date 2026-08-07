@@ -267,7 +267,7 @@ python inference.py \
   --checkpoint ./gemma-12B-ifpruning-output
 ```
 
-The checkpoint must contain the current manifest, base tokenizer, predictor tokenizer and the predictor payload produced by `train.py`. Use `--predictor-model` only when the path recorded in the manifest is unavailable on the inference machine.
+New checkpoints contain the manifest, both tokenizers and the predictor payload produced by `train.py`. For a checkpoint created before predictor tokenizers were embedded, inference uses the local predictor path recorded in the manifest. Use `--predictor-model` when that path is unavailable on the inference machine.
 
 Useful options:
 
